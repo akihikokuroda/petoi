@@ -1,0 +1,2 @@
+MAC: D0:EF:76:CD:EC:3A
+Name: Bittle55_BLE
