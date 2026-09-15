@@ -97,7 +97,6 @@ class BittleBLEController:
             for device in devices:
                 print(f"  Name: {device.name}")
                 print(f"  Address: {device.address}")
-                print(f"  RSSI: {device.rssi}\n")
 
                 if device.name and "Bittle" in device.name:
                     print(f"✓ Bittle found: {device.name} ({device.address})")
