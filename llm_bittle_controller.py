@@ -12,18 +12,10 @@ from typing import Optional, Any
 from dataclasses import dataclass
 
 try:
-    from anthropic import Anthropic
+    import requests
 except ImportError:
-    print("❌ Anthropic SDK not installed. Install with: pip install anthropic")
+    print("❌ requests library not installed. Install with: pip install requests")
     sys.exit(1)
-
-try:
-    from mellea import start_session
-    from mellea.backends import ModelOption
-    from mellea.stdlib.context import ChatContext
-    MELLEA_AVAILABLE = True
-except ImportError:
-    MELLEA_AVAILABLE = False
 
 from petoi_bittle_controller import BittleBLEController, SKILLS, MOTOR_INDICES
 
@@ -42,11 +34,12 @@ class ToolResult:
 
 
 class LLMBittleController:
-    """Bridge between Claude LLM and Petoi Bittle robot"""
+    """Bridge between ollama LLM and Petoi Bittle robot"""
 
     def __init__(self, bittle_address: Optional[str] = None):
         self.bittle = BittleBLEController(address=bittle_address, command_delay=0.05)
-        self.client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        self.ollama_url = "http://localhost:11434/api/generate"
+        self.model = "granite4.2:3b"
         self.conversation_history = []
 
     async def connect(self) -> bool:
@@ -398,52 +391,35 @@ express those concepts.
 - Always provide feedback on what the robot is doing"""
 
     async def chat(self, user_message: str) -> str:
-        """Send a message and get a response from Claude"""
+        """Send a message and get a response from ollama"""
         self.conversation_history.append({"role": "user", "content": user_message})
 
-        while True:
-            response = self.client.messages.create(
-                model="claude-opus-5",
-                max_tokens=1024,
-                system=self.get_system_prompt(),
-                tools=self.get_tools(),
-                messages=self.conversation_history,
+        messages_text = self.get_system_prompt() + "\n\n"
+        for msg in self.conversation_history:
+            messages_text += f"{msg['role'].upper()}: {msg['content']}\n"
+        messages_text += "ASSISTANT: "
+
+        payload = {
+            "model": self.model,
+            "prompt": messages_text,
+            "stream": False,
+            "temperature": 0.7,
+        }
+
+        try:
+            response = requests.post(self.ollama_url, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            assistant_response = result.get("response", "")
+
+            self.conversation_history.append(
+                {"role": "assistant", "content": assistant_response}
             )
-
-            # Check if we need to handle tool calls
-            if response.stop_reason == "tool_use":
-                # Process all tool calls in the response
-                assistant_message = {"role": "assistant", "content": response.content}
-                self.conversation_history.append(assistant_message)
-
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        print(f"  → Calling tool: {block.name}")
-                        result = await self.process_tool_call(block.name, block.input)
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": result,
-                            }
-                        )
-
-                # Add tool results to conversation
-                self.conversation_history.append(
-                    {"role": "user", "content": tool_results}
-                )
-            else:
-                # End of conversation - extract and return final text
-                final_response = ""
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        final_response += block.text
-
-                self.conversation_history.append(
-                    {"role": "assistant", "content": response.content}
-                )
-                return final_response
+            return assistant_response
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Error communicating with ollama: {e}"
+            print(f"❌ {error_msg}")
+            return error_msg
 
     async def interactive_chat(self):
         """Run an interactive chat loop"""
