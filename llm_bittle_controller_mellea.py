@@ -1,28 +1,20 @@
 #!/usr/bin/env python3
 """
 LLM-controlled Petoi Bittle using Mellea framework
-Automatic tool orchestration with Claude or Ollama backend
+Automatic tool orchestration with Ollama backend
 """
 
 import asyncio
-import json
 import os
 import sys
-from typing import Optional, Any
+from typing import Optional
 from dataclasses import dataclass
 
 try:
     from mellea import start_session
-    from mellea.backends import ModelOption
     from mellea.stdlib.context import ChatContext
 except ImportError:
     print("❌ Mellea not installed. Install with: pip install mellea")
-    sys.exit(1)
-
-try:
-    from anthropic import Anthropic
-except ImportError:
-    print("❌ Anthropic SDK not installed. Install with: pip install anthropic")
     sys.exit(1)
 
 from petoi_bittle_controller import BittleBLEController, SKILLS, MOTOR_INDICES
@@ -44,28 +36,16 @@ class ToolResult:
 class LLMBittleController:
     """Bridge between Mellea LLM and Petoi Bittle robot"""
 
-    def __init__(self, bittle_address: Optional[str] = None, use_ollama: bool = False):
+    def __init__(self, bittle_address: Optional[str] = None):
         self.bittle = BittleBLEController(address=bittle_address, command_delay=0.05)
-        self.use_ollama = use_ollama
         self.conversation_history = []
 
-        # Initialize Mellea session
-        if use_ollama:
-            self.mellea = start_session(
-                model_option=ModelOption(
-                    provider="ollama",
-                    model="granite4.2:3b",
-                    base_url="http://localhost:11434",
-                )
-            )
-        else:
-            self.mellea = start_session(
-                model_option=ModelOption(
-                    provider="anthropic",
-                    model="claude-opus-5",
-                    api_key=os.environ.get("ANTHROPIC_API_KEY"),
-                )
-            )
+        # Initialize Mellea session with Ollama
+        self.mellea = start_session(
+            backend_name="ollama",
+            model_id="granite4.2:3b",
+            context_type="chat"
+        )
 
     async def connect(self) -> bool:
         """Connect to the Bittle robot"""
@@ -368,34 +348,17 @@ express those concepts.
         - Tool execution and result processing
         - Multi-turn conversation management
         """
-        # Add user message to conversation history
-        self.conversation_history.append({"role": "user", "content": user_message})
-
-        # Create chat context for multi-turn conversation
-        ctx = ChatContext(system_prompt=self.get_system_prompt())
-
-        # Add all conversation history to context
-        for msg in self.conversation_history:
-            if msg["role"] == "user":
-                ctx.add_user_message(msg["content"])
-            elif msg["role"] == "assistant":
-                ctx.add_assistant_message(msg["content"])
-
         try:
-            # Use Mellea's instruct method for automatic tool calling
+            # Use Mellea's chat method for automatic tool calling
             # This handles the entire agentic loop internally
             result = await asyncio.to_thread(
-                self.mellea.instruct,
-                ctx,
-                tool_use=True,
-                max_turns=5,
+                self.mellea.chat,
+                user_message,
+                tool_calls=True,
             )
 
             # Extract final response text
             final_response = str(result)
-
-            # Store in conversation history
-            self.conversation_history.append({"role": "assistant", "content": final_response})
 
             return final_response
 
@@ -442,17 +405,15 @@ async def main():
 
     parser = argparse.ArgumentParser(description="Control Bittle with LLM (Mellea-powered)")
     parser.add_argument("--address", help="Bittle Bluetooth address (optional)")
-    parser.add_argument("--ollama", action="store_true", help="Use Ollama backend instead of Claude")
     args = parser.parse_args()
 
-    controller = LLMBittleController(bittle_address=args.address, use_ollama=args.ollama)
+    controller = LLMBittleController(bittle_address=args.address)
 
     if not await controller.connect():
         print("\n❌ Failed to connect to Bittle")
         print("Troubleshooting:")
         print("  1. Ensure Bittle is powered on")
         print("  2. Pair Bittle via Bluetooth settings")
-        print("  3. Set ANTHROPIC_API_KEY environment variable")
         sys.exit(1)
 
     try:
