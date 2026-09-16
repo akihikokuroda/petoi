@@ -11,6 +11,8 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from llm_bittle_controller_mellea import LLMBittleController
+
 
 async def demonstrate_emotion(controller, emotion: str):
     """Have Bittle express an emotion"""
@@ -27,21 +29,9 @@ async def main():
     """Run emotion examples"""
     parser = argparse.ArgumentParser(description="Express emotions through Bittle movements")
     parser.add_argument("--address", help="Bittle Bluetooth address (optional)")
-    parser.add_argument("--ollama", action="store_true", help="Use Ollama backend instead of Claude")
-    parser.add_argument("--mellea", action="store_true", help="Use Mellea framework")
     args = parser.parse_args()
 
-    # Use Mellea implementation if requested or if Ollama is requested
-    if args.mellea or args.ollama:
-        try:
-            from llm_bittle_controller_mellea import LLMBittleController
-        except ImportError:
-            print("❌ Mellea not available. Using Claude API instead.")
-            from llm_bittle_controller import LLMBittleController
-        controller = LLMBittleController(bittle_address=args.address, use_ollama=args.ollama)
-    else:
-        from llm_bittle_controller import LLMBittleController
-        controller = LLMBittleController(bittle_address=args.address)
+    controller = LLMBittleController(bittle_address=args.address)
 
     if not await controller.connect():
         print("❌ Failed to connect to Bittle")

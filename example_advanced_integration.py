@@ -13,23 +13,14 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Try to import the Mellea version first, fall back to Claude API version
-try:
-    from llm_bittle_controller_mellea import LLMBittleController as BaseLLMBittleController
-    USING_MELLEA = True
-except ImportError:
-    from llm_bittle_controller import LLMBittleController as BaseLLMBittleController
-    USING_MELLEA = False
+from llm_bittle_controller_mellea import LLMBittleController as BaseLLMBittleController
 
 
 class AdvancedBittleController(BaseLLMBittleController):
     """Extended controller with custom tools"""
 
-    def __init__(self, bittle_address=None, use_ollama=False):
-        if USING_MELLEA:
-            super().__init__(bittle_address, use_ollama=use_ollama)
-        else:
-            super().__init__(bittle_address)
+    def __init__(self, bittle_address=None):
+        super().__init__(bittle_address)
         self.motion_log = []
         self.command_count = 0
 
@@ -363,7 +354,6 @@ async def main():
     """Run advanced examples"""
     parser = argparse.ArgumentParser(description="Advanced LLM Bittle integration examples")
     parser.add_argument("--address", help="Bittle Bluetooth address (optional)")
-    parser.add_argument("--ollama", action="store_true", help="Use Ollama backend instead of Claude")
     args = parser.parse_args()
 
     examples = [
@@ -377,24 +367,14 @@ async def main():
     print("\n" + "=" * 70)
     print("🚀 Advanced LLM Bittle Integration Examples")
     print("=" * 70)
-    print(f"Using: {'Mellea Framework' if USING_MELLEA else 'Claude API'}")
+    print("Using: Mellea Framework")
     print("\nAvailable examples:")
     for i, (name, _) in enumerate(examples, 1):
         print(f"  {i}. {name}")
 
-    # Store args for example functions to use
-    import builtins
-    original_print = builtins.print
-    example_args = args
-
     # Run all examples sequentially
     for name, example_func in examples:
         try:
-            # Create controller with proper args
-            controller = AdvancedBittleController(
-                bittle_address=args.address,
-                use_ollama=args.ollama if USING_MELLEA else False
-            )
             await example_func()
             await asyncio.sleep(2)
         except Exception as e:

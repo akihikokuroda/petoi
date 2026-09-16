@@ -14,7 +14,7 @@ Usage:
 
 import asyncio
 import sys
-from bittle_llm_controller import BitteleLLMController
+from llm_bittle_controller_mellea import LLMBittleController
 
 
 async def example_basic_commands():
@@ -23,7 +23,7 @@ async def example_basic_commands():
     print("Example 1: Basic Commands")
     print("=" * 70)
 
-    controller = BitteleLLMController(use_ollama=False)
+    controller = LLMBittleController()
 
     if not await controller.connect():
         print("Failed to connect to Bittle")
@@ -52,7 +52,7 @@ async def example_complex_sequences():
     print("Example 2: Complex Motion Sequences")
     print("=" * 70)
 
-    controller = BitteleLLMController(use_ollama=False)
+    controller = LLMBittleController()
 
     if not await controller.connect():
         print("Failed to connect to Bittle")
@@ -81,7 +81,7 @@ async def example_status_queries():
     print("Example 3: Status Queries")
     print("=" * 70)
 
-    controller = BitteleLLMController(use_ollama=False)
+    controller = LLMBittleController()
 
     if not await controller.connect():
         print("Failed to connect to Bittle")
@@ -110,7 +110,7 @@ async def example_multi_turn_conversation():
     print("Example 4: Multi-Turn Conversation")
     print("=" * 70)
 
-    controller = BitteleLLMController(use_ollama=False)
+    controller = LLMBittleController()
 
     if not await controller.connect():
         print("Failed to connect to Bittle")
@@ -142,7 +142,7 @@ async def example_direct_tool_calling():
     print("Example 5: Direct Tool Execution (Testing)")
     print("=" * 70)
 
-    controller = BitteleLLMController(use_ollama=False)
+    controller = LLMBittleController()
 
     if not await controller.connect():
         print("Failed to connect to Bittle")
@@ -181,14 +181,9 @@ async def example_with_ollama():
     print("\n" + "=" * 70)
     print("Example 6: Using Ollama Backend")
     print("=" * 70)
-    print("Make sure Ollama is running: ollama serve")
-    print("And granite model is pulled: ollama pull granite4.2:3b")
+    print("Note: This example uses the Mellea framework")
 
-    controller = BitteleLLMController(
-        use_ollama=True,
-        ollama_base_url="http://localhost:11434",
-        ollama_model="granite4.2:3b"
-    )
+    controller = LLMBittleController()
 
     if not await controller.connect():
         print("Failed to connect to Bittle")
@@ -204,7 +199,7 @@ async def example_with_ollama():
         for cmd in commands:
             print(f"\nUser: {cmd}")
             response = await controller.chat(cmd)
-            print(f"Bittle (via Ollama): {response}")
+            print(f"Bittle: {response}")
             await asyncio.sleep(1)
 
     finally:
@@ -217,7 +212,7 @@ async def example_error_handling():
     print("Example 7: Error Handling")
     print("=" * 70)
 
-    controller = BitteleLLMController(use_ollama=False)
+    controller = LLMBittleController()
 
     if not await controller.connect():
         print("Failed to connect to Bittle")
@@ -284,7 +279,7 @@ async def main():
             print("Interactive Mode")
             print("=" * 70)
 
-            controller = BitteleLLMController(use_ollama=False)
+            controller = LLMBittleController()
             if await controller.connect():
                 try:
                     await controller.interactive_loop()

@@ -8,29 +8,26 @@ import asyncio
 import sys
 import os
 import argparse
+import logging
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+from llm_bittle_controller_mellea import LLMBittleController
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 async def main():
     """Run dance example"""
     parser = argparse.ArgumentParser(description="Make Bittle dance")
     parser.add_argument("--address", help="Bittle Bluetooth address (optional)")
-    parser.add_argument("--ollama", action="store_true", help="Use Ollama backend instead of Claude")
-    parser.add_argument("--mellea", action="store_true", help="Use Mellea framework")
     args = parser.parse_args()
 
-    # Use Mellea implementation if requested or if Ollama is requested
-    if args.mellea or args.ollama:
-        try:
-            from llm_bittle_controller_mellea import LLMBittleController
-        except ImportError:
-            print("❌ Mellea not available. Using Claude API instead.")
-            from llm_bittle_controller import LLMBittleController
-        controller = LLMBittleController(bittle_address=args.address, use_ollama=args.ollama)
-    else:
-        from llm_bittle_controller import LLMBittleController
-        controller = LLMBittleController(bittle_address=args.address)
+    controller = LLMBittleController(bittle_address=args.address)
 
     if not await controller.connect():
         print("❌ Failed to connect to Bittle")
@@ -39,7 +36,13 @@ async def main():
     try:
         print("\n🎵 Making Bittle dance...\n")
 
-        response = await controller.chat("Make Bittle dance! Do something fun and energetic.")
+        user_message = "Make Bittle dance! Do something fun and energetic."
+        logger.debug(f"📤 Sending to LLM: {user_message}")
+        print(f"📤 Sending to LLM: {user_message}")
+
+        response = await controller.chat(user_message)
+
+        logger.debug(f"📥 Received from LLM: {response}")
         print(f"🤖 Response: {response}\n")
 
     finally:
