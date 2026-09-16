@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 """
 LLM-controlled Petoi Bittle using Mellea framework
-Automatic tool orchestration with Ollama backend
+Manual tool orchestration with explicit context management
 """
 
 import asyncio
 import os
 import sys
-from typing import Optional
+from typing import Optional, Callable, Any
 from dataclasses import dataclass
 
 try:
-    from mellea import start_session
-    from mellea.stdlib.context import ChatContext
+    from mellea import MelleaSession
+    from mellea.backends import tool, ModelOption
+    from mellea.backends.ollama import OllamaModelBackend
+    from mellea.stdlib.context import SimpleContext
+    from mellea.stdlib.components import Message
+    from mellea.stdlib.functional import aact, acall_tools
 except ImportError:
     print("❌ Mellea not installed. Install with: pip install mellea")
     sys.exit(1)
 
 from petoi_bittle_controller import BittleBLEController, SKILLS, MOTOR_INDICES
+
+# Global reference to controller (used by standalone tool functions)
+_current_controller = None
 
 
 @dataclass
@@ -33,19 +40,377 @@ class ToolResult:
         return result
 
 
+# Standalone tool functions (these will be called by Mellea)
+@tool(name="bittle_execute_skill")
+async def tool_execute_skill(skill_name: str) -> dict:
+    """Execute a predefined skill or behavior on the Bittle robot.
+
+    This is the safest way to make the robot move. Skills are pre-programmed sequences
+    that handle complex motor coordination automatically.
+
+    Args:
+        skill_name: The name of the skill to execute. Valid skills are:
+            - sit, stand, sleep, rest, idle: Basic postures
+            - walk_forward, walk_backward, walk_left, walk_right: Walking gaits
+            - trot_forward, trot_backward, trot_left, trot_right: Trotting gaits
+            - balance: Balance and stabilization
+            - stretch: Full body stretch
+            - pee, pick_up_left, pick_up_right: Fun/specialty behaviors
+
+    Returns:
+        dict with 'success' (bool), 'skill' (str), and 'message' (str).
+        success=True means the skill executed successfully.
+
+    Examples:
+        - To make the robot stand: use 'stand'
+        - To make it walk forward: use 'walk_forward'
+        - To make it dance: combine 'walk_forward' and 'trot_left' in a sequence
+    """
+    controller = _current_controller
+    if not controller:
+        return {"success": False, "message": "Controller not initialized"}
+
+    if skill_name not in SKILLS:
+        return {
+            "success": False,
+            "skill": skill_name,
+            "message": f"Unknown skill: {skill_name}. Available: {', '.join(SKILLS.keys())}"
+        }
+
+    try:
+        success = await controller.bittle.execute_skill(skill_name)
+        return {
+            "success": success,
+            "skill": skill_name,
+            "message": f"Executed skill: {skill_name}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "skill": skill_name,
+            "message": f"Error executing {skill_name}: {str(e)}"
+        }
+
+
+@tool(name="bittle_control_motor")
+async def tool_control_motor(motor_name: str, angle: int, duration: float = 0.1) -> dict:
+    """Control an individual servo motor on the Bittle robot for precise movements.
+
+    Use this for fine-tuning specific motors or creating custom animations. Exercise caution
+    to avoid straining the servos with extreme angles or rapid movements.
+
+    Args:
+        motor_name: The motor to control. Valid motor names are:
+            - neck: Head/neck rotation (useful for looking around)
+            - left_shoulder, right_shoulder: Front leg shoulder joints
+            - left_hip, right_hip: Back leg hip joints
+            - left_arm, right_arm: Arm movements (if equipped)
+            - left_ankle, right_ankle: Foot/ankle movements
+        angle: Target angle in degrees, must be between -90 and +90.
+            - Negative angles rotate one direction (e.g., left)
+            - Positive angles rotate the opposite direction (e.g., right)
+            - 0 degrees is neutral/center position
+        duration: How long the movement takes in seconds (default: 0.1).
+            - Smaller values (0.05-0.1) are faster movements
+            - Larger values (0.5-1.0) are slower, smoother movements
+
+    Returns:
+        dict with 'success' (bool), 'motor' (str), 'angle' (int), and 'message' (str).
+
+    Examples:
+        - Tilt head left: motor_name='neck', angle=-45
+        - Raise left shoulder: motor_name='left_shoulder', angle=45
+        - Slow arm movement: motor_name='left_arm', angle=30, duration=0.5
+    """
+    controller = _current_controller
+    if not controller:
+        return {"success": False, "message": "Controller not initialized"}
+
+    motor_map = {
+        "neck": 0,
+        "left_shoulder": 8,
+        "right_shoulder": 9,
+        "right_hip": 10,
+        "left_hip": 11,
+        "left_arm": 12,
+        "right_arm": 13,
+        "right_ankle": 14,
+        "left_ankle": 15,
+    }
+
+    if motor_name not in motor_map:
+        return {
+            "success": False,
+            "motor": motor_name,
+            "angle": angle,
+            "message": f"Unknown motor: {motor_name}. Available: {', '.join(motor_map.keys())}"
+        }
+
+    if angle < -90 or angle > 90:
+        return {
+            "success": False,
+            "motor": motor_name,
+            "angle": angle,
+            "message": f"Angle {angle}° out of range [-90, +90]"
+        }
+
+    try:
+        motor_index = motor_map[motor_name]
+        success = await controller.bittle.execute_motor(motor_index, angle)
+        return {
+            "success": success,
+            "motor": motor_name,
+            "angle": angle,
+            "message": f"Motor {motor_name} moved to {angle}°"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "motor": motor_name,
+            "angle": angle,
+            "message": f"Error controlling motor: {str(e)}"
+        }
+
+
+@tool(name="bittle_get_status")
+async def tool_get_status() -> dict:
+    """Query the current status of the Bittle robot connection.
+
+    Use this to check if the robot is connected via Bluetooth before executing movements.
+    Always verify connection before attempting important tasks.
+
+    Args:
+        (none)
+
+    Returns:
+        dict with:
+            - 'success' (bool): True if status was retrieved
+            - 'connected' (bool): True if robot is connected via Bluetooth
+            - 'message' (str): Status description
+
+    Connection status interpretation:
+        - connected=True: Robot is ready and can accept commands
+        - connected=False: Robot is not connected; reconnect before sending commands
+
+    Example use cases:
+        - Before executing a dance: "Check if the robot is connected"
+        - To verify robot is ready: "Is the robot connected and ready?"
+        - Before complex sequences: "Make sure the robot is connected first"
+    """
+    controller = _current_controller
+    if not controller:
+        return {"success": False, "connected": False, "message": "Controller not initialized"}
+
+    try:
+        is_connected = controller.bittle.connected
+        return {
+            "success": True,
+            "connected": is_connected,
+            "message": f"Robot is {'connected and ready' if is_connected else 'not connected'}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "connected": False,
+            "message": f"Error checking status: {str(e)}"
+        }
+
+
+@tool(name="bittle_beep")
+async def tool_beep(frequency: int = 1000, duration: float = 100) -> dict:
+    """Make the Bittle produce a beep sound for audio feedback or acknowledgment.
+
+    Use beeping to add audio effects to movements, acknowledge user input, or express emotions
+    through sound (e.g., happy beeps when excited, sad beeps when sad).
+
+    Args:
+        frequency: Pitch of the beep in Hertz (Hz). Default: 1000
+            - 500 Hz: Low, deep beep (serious, sad)
+            - 1000 Hz: Medium beep (default, neutral)
+            - 2000 Hz: High, sharp beep (happy, excited)
+            - 100-300 Hz: Very low bass (threatening, power)
+            - 3000+ Hz: Very high (alarm, warning)
+        duration: How long the beep lasts in milliseconds. Default: 100
+            - 50 ms: Quick beep
+            - 100 ms: Normal beep
+            - 200-500 ms: Extended beep
+            - 1000+ ms: Long sustained tone
+
+    Returns:
+        dict with 'success' (bool), 'message' (str) describing the beep.
+
+    Examples:
+        - Happy acknowledgment: frequency=2000, duration=150
+        - Sad sound: frequency=300, duration=200
+        - Alarm/warning: frequency=1500, duration=100 (repeated)
+        - Thinking/processing: frequency=800, duration=100
+        - Question/confused: frequency=1200, duration=80
+    """
+    controller = _current_controller
+    if not controller:
+        return {"success": False, "message": "Controller not initialized"}
+
+    try:
+        cmd = f"b{int(frequency)}"
+        await controller.bittle.send_command(cmd)
+        return {
+            "success": True,
+            "message": f"Beep: {frequency}Hz for {duration}ms"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error producing beep: {str(e)}"
+        }
+
+
+@tool(name="bittle_calibrate_motor")
+async def tool_calibrate_motor(motor_name: str, offset: int = 0) -> dict:
+    """Calibrate a motor to adjust its neutral/center position.
+
+    Use this if a motor is not centered correctly or has drifted. Calibration sets the
+    offset so that 0 degrees maps to the true neutral position for that motor.
+
+    Args:
+        motor_name: The motor to calibrate. Valid names are:
+            - neck, left_shoulder, right_shoulder, left_hip, right_hip
+            - left_arm, right_arm, left_ankle, right_ankle
+        offset: The calibration offset in degrees (default: 0).
+            - Positive values: rotate the motor in the positive direction
+            - Negative values: rotate the motor in the negative direction
+            - 0: Reset to default neutral position
+            - Typical range: -15 to +15 degrees
+
+    Returns:
+        dict with 'success' (bool), 'motor' (str), 'offset' (int), 'message' (str).
+
+    When to calibrate:
+        - Motor is tilted when standing normally
+        - Motor drifts during operation
+        - After assembly or servo replacement
+        - If movements seem off-center
+
+    Example:
+        - Motor is tilted 10° to the left: use offset=-10 to correct
+        - Motor is tilted 5° to the right: use offset=5 to correct
+        - Reset to default: use offset=0
+    """
+    controller = _current_controller
+    if not controller:
+        return {"success": False, "message": "Controller not initialized"}
+
+    try:
+        cmd = f"c{int(offset)}"
+        await controller.bittle.send_command(cmd)
+        return {
+            "success": True,
+            "motor": motor_name,
+            "offset": offset,
+            "message": f"Motor {motor_name} calibrated with offset {offset}°"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "motor": motor_name,
+            "offset": offset,
+            "message": f"Error calibrating motor: {str(e)}"
+        }
+
+
+@tool(name="bittle_sequence_motion")
+async def tool_sequence_motion(sequence: list[dict], repeat: int = 1) -> dict:
+    """Execute a sequence of motor movements to create custom behaviors and animations.
+
+    Combine skills and individual motor controls into a choreographed sequence. This is perfect
+    for creating dances, expressive movements, or complex multi-step behaviors.
+
+    Args:
+        sequence: A list of motion step dictionaries. Each step is one of:
+            Skill step: {"skill": "skill_name", "duration": 0.5}
+                - Executes a predefined skill like 'walk_forward', 'trot_left', etc.
+                - duration (optional): pause after the skill completes (in seconds)
+            Motor step: {"motor": "motor_name", "angle": 45, "duration": 0.3}
+                - Moves a specific motor to an angle
+                - duration: how long the movement takes (in seconds)
+        repeat: How many times to repeat the entire sequence (default: 1).
+            - repeat=1: Execute once
+            - repeat=2: Execute twice in a row
+            - repeat=3+: Multiple repetitions for looped behaviors
+
+    Returns:
+        dict with 'success' (bool), 'sequence_id' (str), 'steps_executed' (int), 'message' (str).
+
+    Examples:
+        Dance sequence:
+        [
+            {"skill": "stand"},
+            {"skill": "walk_forward", "duration": 1.0},
+            {"motor": "neck", "angle": -30, "duration": 0.3},
+            {"motor": "neck", "angle": 30, "duration": 0.3},
+            {"skill": "trot_left", "duration": 0.5},
+            {"skill": "trot_right", "duration": 0.5},
+            {"skill": "sit"}
+        ]
+
+        Confusing gesture:
+        [
+            {"motor": "neck", "angle": 45, "duration": 0.2},
+            {"motor": "neck", "angle": -45, "duration": 0.2},
+            {"motor": "left_arm", "angle": -30, "duration": 0.2},
+            {"motor": "right_arm", "angle": 30, "duration": 0.2}
+        ]
+    """
+    controller = _current_controller
+    if not controller:
+        return {"success": False, "message": "Controller not initialized"}
+
+    try:
+        steps_executed = 0
+        for rep in range(repeat):
+            for step in sequence:
+                if "skill" in step:
+                    result = await tool_execute_skill(step["skill"])
+                    if result["success"]:
+                        steps_executed += 1
+                    if "duration" in step:
+                        await asyncio.sleep(step["duration"])
+                elif "motor" in step and "angle" in step:
+                    result = await tool_control_motor(
+                        step["motor"],
+                        step["angle"],
+                        step.get("duration", 0.1),
+                    )
+                    if result["success"]:
+                        steps_executed += 1
+                    if "duration" in step:
+                        await asyncio.sleep(step["duration"])
+
+        return {
+            "success": True,
+            "sequence_id": f"seq_{int(asyncio.get_event_loop().time())}",
+            "steps_executed": steps_executed,
+            "message": f"Sequence completed with {steps_executed} steps ({repeat} repetition(s))"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "sequence_id": None,
+            "steps_executed": 0,
+            "message": f"Error executing sequence: {str(e)}"
+        }
+
+
 class LLMBittleController:
     """Bridge between Mellea LLM and Petoi Bittle robot"""
 
     def __init__(self, bittle_address: Optional[str] = None):
+        global _current_controller
         self.bittle = BittleBLEController(address=bittle_address, command_delay=0.05)
-        self.conversation_history = []
-
-        # Initialize Mellea session with Ollama
-        self.mellea = start_session(
-            backend_name="ollama",
-            model_id="granite4.2:3b",
-            context_type="chat"
-        )
+        backend = OllamaModelBackend(model_id="granite4.2:3b")
+        context = SimpleContext()
+        self.mellea = MelleaSession(backend, context)
+        _current_controller = self
+        self.tool_functions = self.get_tool_functions()
 
     async def connect(self) -> bool:
         """Connect to the Bittle robot"""
@@ -55,247 +420,17 @@ class LLMBittleController:
         """Disconnect from the Bittle robot"""
         await self.bittle.disconnect()
 
-    def _register_tools(self):
-        """Register all Bittle control tools with Mellea"""
-        # These tool functions will be called by Mellea automatically
-        self.tools = {
-            "bittle_execute_skill": self._tool_execute_skill,
-            "bittle_control_motor": self._tool_control_motor,
-            "bittle_sequence_motion": self._tool_sequence_motion,
-            "bittle_get_status": self._tool_get_status,
-            "bittle_beep": self._tool_beep,
-            "bittle_calibrate_motor": self._tool_calibrate_motor,
+    def get_tool_functions(self) -> dict:
+        """Return tool function implementations for Mellea"""
+        return {
+            "bittle_execute_skill": tool_execute_skill,
+            "bittle_control_motor": tool_control_motor,
+            "bittle_sequence_motion": tool_sequence_motion,
+            "bittle_get_status": tool_get_status,
+            "bittle_beep": tool_beep,
+            "bittle_calibrate_motor": tool_calibrate_motor,
         }
 
-    async def _tool_execute_skill(self, skill_name: str) -> dict:
-        """Execute a predefined skill or behavior on the Bittle robot.
-
-        Args:
-            skill_name: One of: sit, stand, walk_forward, walk_backward, walk_left,
-                       walk_right, trot_forward, trot_backward, trot_left, trot_right,
-                       balance, stretch, pee, rest, sleep, idle, pick_up_left, pick_up_right
-
-        Returns:
-            dict with success status, skill name, and message
-        """
-        if skill_name not in SKILLS:
-            return {
-                "success": False,
-                "skill": skill_name,
-                "message": f"Unknown skill: {skill_name}. Available: {', '.join(SKILLS.keys())}"
-            }
-
-        try:
-            success = await self.bittle.execute_skill(skill_name)
-            return {
-                "success": success,
-                "skill": skill_name,
-                "message": f"Executed skill: {skill_name}"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "skill": skill_name,
-                "message": f"Error executing {skill_name}: {str(e)}"
-            }
-
-    async def _tool_control_motor(self, motor_name: str, angle: int, duration: float = 0.1) -> dict:
-        """Control an individual servo motor on the Bittle.
-
-        Args:
-            motor_name: Motor name (neck, left_shoulder, right_shoulder, etc.) or index (0, 8-15)
-            angle: Target angle in degrees (-90 to +90)
-            duration: Time to reach target in seconds (default: 0.1)
-
-        Returns:
-            dict with success status, motor, angle, and message
-        """
-        motor_map = {
-            "neck": 0,
-            "left_shoulder": 8,
-            "right_shoulder": 9,
-            "right_hip": 10,
-            "left_hip": 11,
-            "left_arm": 12,
-            "right_arm": 13,
-            "right_ankle": 14,
-            "left_ankle": 15,
-        }
-
-        if motor_name not in motor_map:
-            return {
-                "success": False,
-                "motor": motor_name,
-                "angle": angle,
-                "message": f"Unknown motor: {motor_name}. Available: {', '.join(motor_map.keys())}"
-            }
-
-        if angle < -90 or angle > 90:
-            return {
-                "success": False,
-                "motor": motor_name,
-                "angle": angle,
-                "message": f"Angle {angle}° out of range [-90, +90]"
-            }
-
-        try:
-            motor_index = motor_map[motor_name]
-            success = await self.bittle.execute_motor(motor_index, angle)
-            return {
-                "success": success,
-                "motor": motor_name,
-                "angle": angle,
-                "message": f"Motor {motor_name} moved to {angle}°"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "motor": motor_name,
-                "angle": angle,
-                "message": f"Error controlling motor: {str(e)}"
-            }
-
-    async def _tool_sequence_motion(self, sequence: list, repeat: int = 1) -> dict:
-        """Execute a sequence of motor movements to create custom behaviors.
-
-        Args:
-            sequence: List of motion steps. Each step is a dict with either:
-                      - "skill": skill_name and "duration": float
-                      - "motor": motor_name, "angle": int, and "duration": float
-            repeat: Number of times to repeat the sequence (default: 1)
-
-        Returns:
-            dict with success status, sequence_id, steps executed, and message
-        """
-        try:
-            steps_executed = 0
-            for rep in range(repeat):
-                for step in sequence:
-                    if "skill" in step:
-                        result = await self._tool_execute_skill(step["skill"])
-                        if result["success"]:
-                            steps_executed += 1
-                        if "duration" in step:
-                            await asyncio.sleep(step["duration"])
-                    elif "motor" in step and "angle" in step:
-                        result = await self._tool_control_motor(
-                            step["motor"],
-                            step["angle"],
-                            step.get("duration", 0.1),
-                        )
-                        if result["success"]:
-                            steps_executed += 1
-                        if "duration" in step:
-                            await asyncio.sleep(step["duration"])
-
-            return {
-                "success": True,
-                "sequence_id": f"seq_{int(asyncio.get_event_loop().time())}",
-                "steps_executed": steps_executed,
-                "message": f"Sequence completed with {steps_executed} steps ({repeat} repetition(s))"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "sequence_id": None,
-                "steps_executed": 0,
-                "message": f"Error executing sequence: {str(e)}"
-            }
-
-    async def _tool_get_status(self) -> dict:
-        """Query current status of the Bittle robot.
-
-        Returns:
-            dict with connection status, battery voltage, current motion, motor positions
-        """
-        try:
-            return {
-                "connected": self.bittle.connected,
-                "battery_voltage": "N/A",
-                "current_motion": "idle",
-                "motor_positions": {},
-                "timestamp": asyncio.get_event_loop().time(),
-                "message": "Status retrieved successfully"
-            }
-        except Exception as e:
-            return {
-                "connected": False,
-                "battery_voltage": 0,
-                "current_motion": "error",
-                "motor_positions": {},
-                "message": f"Error querying status: {str(e)}"
-            }
-
-    async def _tool_beep(self, frequency: int = 1000, duration: float = 100) -> dict:
-        """Make the Bittle produce a beep sound.
-
-        Args:
-            frequency: Frequency in Hz (default: 1000)
-            duration: Duration in milliseconds (default: 100)
-
-        Returns:
-            dict with success status and message
-        """
-        try:
-            cmd = f"b{int(frequency)}"
-            await self.bittle.send_command(cmd)
-            return {
-                "success": True,
-                "message": f"Beep: {frequency}Hz for {duration}ms"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "message": f"Error producing beep: {str(e)}"
-            }
-
-    async def _tool_calibrate_motor(self, motor_name: str, offset: int = 0) -> dict:
-        """Calibrate a motor to its neutral position.
-
-        Args:
-            motor_name: Motor to calibrate
-            offset: Calibration offset in degrees (default: 0)
-
-        Returns:
-            dict with success status, motor, offset, and message
-        """
-        motor_map = {
-            "neck": 0,
-            "left_shoulder": 8,
-            "right_shoulder": 9,
-            "right_hip": 10,
-            "left_hip": 11,
-            "left_arm": 12,
-            "right_arm": 13,
-            "right_ankle": 14,
-            "left_ankle": 15,
-        }
-
-        if motor_name not in motor_map:
-            return {
-                "success": False,
-                "motor": motor_name,
-                "offset": offset,
-                "message": f"Unknown motor: {motor_name}"
-            }
-
-        try:
-            # Calibrate by moving to neutral position (0 degrees)
-            motor_index = motor_map[motor_name]
-            success = await self.bittle.execute_motor(motor_index, offset)
-            return {
-                "success": success,
-                "motor": motor_name,
-                "offset": offset,
-                "message": f"Motor {motor_name} calibrated with offset {offset}°"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "motor": motor_name,
-                "offset": offset,
-                "message": f"Error calibrating motor: {str(e)}"
-            }
 
     def get_system_prompt(self) -> str:
         """Return the system prompt for LLM"""
@@ -342,25 +477,55 @@ express those concepts.
     async def chat(self, user_message: str) -> str:
         """Send a message and get a response using Mellea framework.
 
-        Mellea automatically handles:
-        - Tool schema generation from Python functions
-        - LLM invocation with tool definitions
-        - Tool execution and result processing
-        - Multi-turn conversation management
+        Handles manual tool orchestration:
+        - Add user message to context
+        - Generate response with tool definitions
+        - Execute requested tools manually
+        - Add tool results back to context
         """
         try:
-            # Use Mellea's chat method for automatic tool calling
-            # This handles the entire agentic loop internally
-            result = await asyncio.to_thread(
-                self.mellea.chat,
-                user_message,
+            ctx = self.mellea.ctx
+
+            # Add user message to context
+            user_msg = Message("user", user_message)
+            ctx = ctx.add(user_msg)
+
+            # Generate response with tool capability
+            tools = list(self.tool_functions.values())
+            response, ctx = await aact(
+                user_msg,
+                ctx,
+                self.mellea.backend,
+                model_options={ModelOption.TOOLS: tools},
                 tool_calls=True,
+                await_result=True,
             )
 
-            # Extract final response text
-            final_response = str(result)
+            # Check if LLM requested tool calls
+            if response.tool_calls:
+                # Execute tools (acall_tools handles the actual execution)
+                tool_messages = await acall_tools(response, self.mellea.backend)
 
-            return final_response
+                # Add tool messages to context
+                for tool_msg in tool_messages:
+                    ctx = ctx.add(tool_msg)
+
+                # Get final response after tool execution
+                final_response, ctx = await aact(
+                    tool_messages[-1] if tool_messages else user_msg,
+                    ctx,
+                    self.mellea.backend,
+                    await_result=True,
+                )
+                response_text = str(final_response.value)
+            else:
+                # No tool calls, use response directly
+                response_text = str(response.value)
+
+            # Update stored context
+            self.mellea._ctx = ctx
+
+            return response_text
 
         except Exception as e:
             error_msg = f"Error during Mellea processing: {str(e)}"
