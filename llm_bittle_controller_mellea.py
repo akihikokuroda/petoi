@@ -16,9 +16,9 @@ try:
     from mellea.backends import tool, ModelOption
     from mellea.backends.ollama import OllamaModelBackend
     from mellea.stdlib.context import SimpleContext
-    from mellea.stdlib.components import Message
-    from mellea.stdlib.functional import aact, acall_tools
-    from mellea.plugins import plugin_scope
+    from mellea.stdlib.components import Message, ToolMessage
+    from mellea.stdlib.functional import aact
+    from mellea.plugins import register
     from mellea.plugins.builtin_debug.generation import (
         log_generation_post_call,
         log_generation_pre_call,
@@ -31,6 +31,9 @@ from petoi_bittle_controller import BittleBLEController, SKILLS, MOTOR_INDICES
 
 # Global reference to controller (used by standalone tool functions)
 _current_controller = None
+
+# Store raw (undecorated) tool functions for manual execution
+_raw_tool_functions = {}
 
 
 @dataclass
@@ -46,9 +49,8 @@ class ToolResult:
         return result
 
 
-# Standalone tool functions (these will be called by Mellea)
-@tool(name="bittle_execute_skill")
-async def tool_execute_skill(skill_name: str) -> dict:
+# Raw tool implementations (stored before decorator)
+async def _impl_execute_skill(skill_name: str) -> dict:
     """Execute a predefined skill or behavior on the Bittle robot.
 
     This is the safest way to make the robot move. Skills are pre-programmed sequences
@@ -98,8 +100,12 @@ async def tool_execute_skill(skill_name: str) -> dict:
         }
 
 
-@tool(name="bittle_control_motor")
-async def tool_control_motor(motor_name: str, angle: int, duration: float = 0.1) -> dict:
+# Store raw implementation and create Mellea-wrapped version
+_raw_tool_functions["bittle_execute_skill"] = _impl_execute_skill
+tool_execute_skill = tool(name="bittle_execute_skill")(_impl_execute_skill)
+
+
+async def _impl_control_motor(motor_name: str, angle: int, duration: float = 0.1) -> dict:
     """Control an individual servo motor on the Bittle robot for precise movements.
 
     Use this for fine-tuning specific motors or creating custom animations. Exercise caution
@@ -178,8 +184,12 @@ async def tool_control_motor(motor_name: str, angle: int, duration: float = 0.1)
         }
 
 
-@tool(name="bittle_get_status")
-async def tool_get_status() -> dict:
+# Store raw implementation and create Mellea-wrapped version
+_raw_tool_functions["bittle_control_motor"] = _impl_control_motor
+tool_control_motor = tool(name="bittle_control_motor")(_impl_control_motor)
+
+
+async def _impl_get_status() -> dict:
     """Query the current status of the Bittle robot connection.
 
     Use this to check if the robot is connected via Bluetooth before executing movements.
@@ -222,8 +232,12 @@ async def tool_get_status() -> dict:
         }
 
 
-@tool(name="bittle_beep")
-async def tool_beep(frequency: int = 1000, duration: float = 100) -> dict:
+# Store raw implementation and create Mellea-wrapped version
+_raw_tool_functions["bittle_get_status"] = _impl_get_status
+tool_get_status = tool(name="bittle_get_status")(_impl_get_status)
+
+
+async def _impl_beep(frequency: int = 1000, duration: float = 100) -> dict:
     """Make the Bittle produce a beep sound for audio feedback or acknowledgment.
 
     Use beeping to add audio effects to movements, acknowledge user input, or express emotions
@@ -270,8 +284,12 @@ async def tool_beep(frequency: int = 1000, duration: float = 100) -> dict:
         }
 
 
-@tool(name="bittle_calibrate_motor")
-async def tool_calibrate_motor(motor_name: str, offset: int = 0) -> dict:
+# Store raw implementation and create Mellea-wrapped version
+_raw_tool_functions["bittle_beep"] = _impl_beep
+tool_beep = tool(name="bittle_beep")(_impl_beep)
+
+
+async def _impl_calibrate_motor(motor_name: str, offset: int = 0) -> dict:
     """Calibrate a motor to adjust its neutral/center position.
 
     Use this if a motor is not centered correctly or has drifted. Calibration sets the
@@ -323,8 +341,12 @@ async def tool_calibrate_motor(motor_name: str, offset: int = 0) -> dict:
         }
 
 
-@tool(name="bittle_sequence_motion")
-async def tool_sequence_motion(sequence: list[dict], repeat: int = 1) -> dict:
+# Store raw implementation and create Mellea-wrapped version
+_raw_tool_functions["bittle_calibrate_motor"] = _impl_calibrate_motor
+tool_calibrate_motor = tool(name="bittle_calibrate_motor")(_impl_calibrate_motor)
+
+
+async def _impl_sequence_motion(sequence: list[dict], repeat: int = 1) -> dict:
     """Execute a sequence of motor movements to create custom behaviors and animations.
 
     Combine skills and individual motor controls into a choreographed sequence. This is perfect
@@ -406,6 +428,11 @@ async def tool_sequence_motion(sequence: list[dict], repeat: int = 1) -> dict:
         }
 
 
+# Store raw implementation and create Mellea-wrapped version
+_raw_tool_functions["bittle_sequence_motion"] = _impl_sequence_motion
+tool_sequence_motion = tool(name="bittle_sequence_motion")(_impl_sequence_motion)
+
+
 class LLMBittleController:
     """Bridge between Mellea LLM and Petoi Bittle robot"""
 
@@ -416,10 +443,12 @@ class LLMBittleController:
         context = SimpleContext()
         self.mellea = MelleaSession(backend, context)
         _current_controller = self
-        self.tool_functions = self.get_tool_functions()
+        self.mellea_tools = self.get_tool_functions()  # Mellea-wrapped tools for LLM
+        self.raw_tools = self._get_raw_tool_functions()  # Raw functions for execution
         self.enable_tracing = enable_tracing
         self._setup_logging()
-        self._tracing_context = None
+        if self.enable_tracing:
+            register([log_generation_pre_call, log_generation_post_call])
 
     def _setup_logging(self):
         """Configure logging for generation tracing"""
@@ -439,7 +468,7 @@ class LLMBittleController:
         await self.bittle.disconnect()
 
     def get_tool_functions(self) -> dict:
-        """Return tool function implementations for Mellea"""
+        """Return Mellea-decorated tool implementations for LLM"""
         return {
             "bittle_execute_skill": tool_execute_skill,
             "bittle_control_motor": tool_control_motor,
@@ -449,6 +478,78 @@ class LLMBittleController:
             "bittle_calibrate_motor": tool_calibrate_motor,
         }
 
+    def _get_raw_tool_functions(self) -> dict:
+        """Return raw async function implementations for manual tool execution.
+
+        Returns the undecorated tool functions stored in the module-level
+        _raw_tool_functions dict. These are the actual implementations that
+        get wrapped by @tool decorators for the LLM.
+        """
+        return _raw_tool_functions
+
+
+    async def _execute_tool_calls(self, response) -> list:
+        """Manually execute tool calls to preserve event loop context.
+
+        Avoids using Mellea's acall_tools() which can break persistent connections
+        like BLE by creating tool messages for each tool call and result.
+        """
+        tool_messages = []
+
+        if not hasattr(response, 'tool_calls') or not response.tool_calls:
+            logging.debug("No tool calls in response")
+            return tool_messages
+
+        logging.debug(f"LLM Response has {len(response.tool_calls)} tool call(s)")
+
+        for i, tool_call in enumerate(response.tool_calls, 1):
+            tool_name = getattr(tool_call, 'name', None)
+
+            # Extract arguments - try different attribute names
+            tool_args = {}
+            if hasattr(tool_call, 'arguments'):
+                tool_args = tool_call.arguments or {}
+            elif hasattr(tool_call, 'args'):
+                tool_args = tool_call.args or {}
+            elif hasattr(tool_call, 'input'):
+                tool_args = tool_call.input or {}
+
+            # Log tool call information
+            logging.debug(f"[TOOL-CALL #{i}] name={tool_name}")
+            logging.debug(f"[TOOL-CALL #{i}] args={tool_args}")
+            if hasattr(tool_call, 'id'):
+                logging.debug(f"[TOOL-CALL #{i}] id={tool_call.id}")
+
+            # Find the raw tool function (not the Mellea-wrapped version)
+            if tool_name not in self.raw_tools:
+                result = {"error": f"Unknown tool: {tool_name}"}
+                logging.error(f"[TOOL-CALL #{i}] ❌ Unknown tool: {tool_name}")
+            else:
+                try:
+                    tool_func = self.raw_tools[tool_name]
+                    logging.debug(f"[TOOL-CALL #{i}] ⏱️  Executing {tool_name}...")
+                    # Call the raw async function with unpacked arguments
+                    result = await tool_func(**tool_args)
+                    logging.debug(f"[TOOL-CALL #{i}] ✅ Success")
+                    logging.debug(f"[TOOL-CALL #{i}] result={result}")
+                except Exception as e:
+                    result = {"error": f"Tool execution failed: {str(e)}"}
+                    logging.error(f"[TOOL-CALL #{i}] ❌ Exception: {str(e)}")
+                    logging.debug(f"[TOOL-CALL #{i}] result={result}", exc_info=True)
+
+            # Create tool message with result
+            tool_msg = ToolMessage(
+                role="tool",
+                content=str(result),
+                tool_output=result,
+                name=tool_name,
+                args=tool_args,
+                tool=tool_call,
+            )
+            tool_messages.append(tool_msg)
+            logging.debug(f"[TOOL-CALL #{i}] Created tool message")
+
+        return tool_messages
 
     def get_system_prompt(self) -> str:
         """Return the system prompt for LLM"""
@@ -510,62 +611,48 @@ express those concepts.
             user_msg = Message("user", user_message)
             ctx = ctx.add(user_msg)
 
-            # Generate response with tool capability
-            tools = list(self.tool_functions.values())
-
-            # Wrap in tracing context if enabled
-            if self.enable_tracing:
-                with plugin_scope([log_generation_pre_call, log_generation_post_call]):
-                    response, ctx = await aact(
-                        user_msg,
-                        ctx,
-                        self.mellea.backend,
-                        model_options={ModelOption.TOOLS: tools},
-                        tool_calls=True,
-                        await_result=True,
-                    )
-            else:
-                response, ctx = await aact(
-                    user_msg,
-                    ctx,
-                    self.mellea.backend,
-                    model_options={ModelOption.TOOLS: tools},
-                    tool_calls=True,
-                    await_result=True,
-                )
+            # Generate response with tool capability (use Mellea-wrapped tools for LLM)
+            tools = list(self.mellea_tools.values())
+            response, ctx = await aact(
+                user_msg,
+                ctx,
+                self.mellea.backend,
+                model_options={ModelOption.TOOLS: tools},
+                tool_calls=True,
+                await_result=True,
+            )
 
             # Check if LLM requested tool calls
             if response.tool_calls:
-                # Execute tools (acall_tools handles the actual execution)
-                if self.enable_tracing:
-                    with plugin_scope([log_generation_pre_call, log_generation_post_call]):
-                        tool_messages = await acall_tools(response, self.mellea.backend)
-                else:
-                    tool_messages = await acall_tools(response, self.mellea.backend)
+                logging.debug("="*70)
+                logging.debug("LLM requested tool calls, executing...")
+                logging.debug("="*70)
+
+                # Manually execute tools to preserve event loop context
+                tool_messages = await self._execute_tool_calls(response)
+
+                logging.debug("="*70)
+                logging.debug(f"Executed {len(tool_messages)} tool call(s), adding to context")
+                logging.debug("="*70)
 
                 # Add tool messages to context
-                for tool_msg in tool_messages:
+                for i, tool_msg in enumerate(tool_messages, 1):
+                    logging.debug(f"Adding tool message {i}/{len(tool_messages)} to context")
                     ctx = ctx.add(tool_msg)
 
                 # Get final response after tool execution
-                if self.enable_tracing:
-                    with plugin_scope([log_generation_pre_call, log_generation_post_call]):
-                        final_response, ctx = await aact(
-                            tool_messages[-1] if tool_messages else user_msg,
-                            ctx,
-                            self.mellea.backend,
-                            await_result=True,
-                        )
-                else:
-                    final_response, ctx = await aact(
-                        tool_messages[-1] if tool_messages else user_msg,
-                        ctx,
-                        self.mellea.backend,
-                        await_result=True,
-                    )
+                logging.debug("Getting final LLM response after tool execution...")
+                final_response, ctx = await aact(
+                    tool_messages[-1] if tool_messages else user_msg,
+                    ctx,
+                    self.mellea.backend,
+                    await_result=True,
+                )
                 response_text = str(final_response.value)
+                logging.debug(f"Final response received: {response_text[:100]}...")
             else:
                 # No tool calls, use response directly
+                logging.debug("No tool calls requested by LLM")
                 response_text = str(response.value)
 
             # Update stored context
