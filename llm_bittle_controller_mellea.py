@@ -5,6 +5,7 @@ Manual tool orchestration with explicit context management
 """
 
 import asyncio
+import logging
 import os
 import sys
 from typing import Optional, Callable, Any
@@ -17,6 +18,11 @@ try:
     from mellea.stdlib.context import SimpleContext
     from mellea.stdlib.components import Message
     from mellea.stdlib.functional import aact, acall_tools
+    from mellea.plugins import plugin_scope
+    from mellea.plugins.builtin_debug.generation import (
+        log_generation_post_call,
+        log_generation_pre_call,
+    )
 except ImportError:
     print("❌ Mellea not installed. Install with: pip install mellea")
     sys.exit(1)
@@ -403,7 +409,7 @@ async def tool_sequence_motion(sequence: list[dict], repeat: int = 1) -> dict:
 class LLMBittleController:
     """Bridge between Mellea LLM and Petoi Bittle robot"""
 
-    def __init__(self, bittle_address: Optional[str] = None):
+    def __init__(self, bittle_address: Optional[str] = None, enable_tracing: bool = True):
         global _current_controller
         self.bittle = BittleBLEController(address=bittle_address, command_delay=0.05)
         backend = OllamaModelBackend(model_id="granite4.2:3b")
@@ -411,6 +417,18 @@ class LLMBittleController:
         self.mellea = MelleaSession(backend, context)
         _current_controller = self
         self.tool_functions = self.get_tool_functions()
+        self.enable_tracing = enable_tracing
+        self._setup_logging()
+        self._tracing_context = None
+
+    def _setup_logging(self):
+        """Configure logging for generation tracing"""
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(message)s"
+        )
+        # Ensure mellea generation tracing is captured (uses logger.debug)
+        logging.getLogger("mellea.plugins.builtin_debug.generation").setLevel(logging.DEBUG)
 
     async def connect(self) -> bool:
         """Connect to the Bittle robot"""
@@ -482,6 +500,8 @@ express those concepts.
         - Generate response with tool definitions
         - Execute requested tools manually
         - Add tool results back to context
+
+        With tracing enabled, logs all LLM input/output and token usage.
         """
         try:
             ctx = self.mellea.ctx
@@ -492,31 +512,57 @@ express those concepts.
 
             # Generate response with tool capability
             tools = list(self.tool_functions.values())
-            response, ctx = await aact(
-                user_msg,
-                ctx,
-                self.mellea.backend,
-                model_options={ModelOption.TOOLS: tools},
-                tool_calls=True,
-                await_result=True,
-            )
+
+            # Wrap in tracing context if enabled
+            if self.enable_tracing:
+                with plugin_scope([log_generation_pre_call, log_generation_post_call]):
+                    response, ctx = await aact(
+                        user_msg,
+                        ctx,
+                        self.mellea.backend,
+                        model_options={ModelOption.TOOLS: tools},
+                        tool_calls=True,
+                        await_result=True,
+                    )
+            else:
+                response, ctx = await aact(
+                    user_msg,
+                    ctx,
+                    self.mellea.backend,
+                    model_options={ModelOption.TOOLS: tools},
+                    tool_calls=True,
+                    await_result=True,
+                )
 
             # Check if LLM requested tool calls
             if response.tool_calls:
                 # Execute tools (acall_tools handles the actual execution)
-                tool_messages = await acall_tools(response, self.mellea.backend)
+                if self.enable_tracing:
+                    with plugin_scope([log_generation_pre_call, log_generation_post_call]):
+                        tool_messages = await acall_tools(response, self.mellea.backend)
+                else:
+                    tool_messages = await acall_tools(response, self.mellea.backend)
 
                 # Add tool messages to context
                 for tool_msg in tool_messages:
                     ctx = ctx.add(tool_msg)
 
                 # Get final response after tool execution
-                final_response, ctx = await aact(
-                    tool_messages[-1] if tool_messages else user_msg,
-                    ctx,
-                    self.mellea.backend,
-                    await_result=True,
-                )
+                if self.enable_tracing:
+                    with plugin_scope([log_generation_pre_call, log_generation_post_call]):
+                        final_response, ctx = await aact(
+                            tool_messages[-1] if tool_messages else user_msg,
+                            ctx,
+                            self.mellea.backend,
+                            await_result=True,
+                        )
+                else:
+                    final_response, ctx = await aact(
+                        tool_messages[-1] if tool_messages else user_msg,
+                        ctx,
+                        self.mellea.backend,
+                        await_result=True,
+                    )
                 response_text = str(final_response.value)
             else:
                 # No tool calls, use response directly
@@ -570,16 +616,20 @@ async def main():
 
     parser = argparse.ArgumentParser(description="Control Bittle with LLM (Mellea-powered)")
     parser.add_argument("--address", help="Bittle Bluetooth address (optional)")
+    parser.add_argument("--no-tracing", action="store_true", help="Disable generation tracing")
     args = parser.parse_args()
 
-    controller = LLMBittleController(bittle_address=args.address)
+    controller = LLMBittleController(
+        bittle_address=args.address,
+        enable_tracing=not args.no_tracing
+    )
 
     if not await controller.connect():
         print("\n❌ Failed to connect to Bittle")
         print("Troubleshooting:")
         print("  1. Ensure Bittle is powered on")
         print("  2. Pair Bittle via Bluetooth settings")
-        sys.exit(1)
+        # sys.exit(1)
 
     try:
         await controller.interactive_chat()
