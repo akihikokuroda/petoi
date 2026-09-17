@@ -361,7 +361,14 @@ tool_calibrate_motor = tool(name="bittle_calibrate_motor")(_impl_calibrate_motor
 
 
 async def _impl_sequence_motion(sequence: list[dict], repeat: int = 1) -> dict:
-    """Execute a sequence of motor movements to create custom behaviors and animations.
+    """Execute a choreographed sequence of movements - USE THIS FOR NARRATIVE/COMPLEX REQUESTS.
+
+    **WHEN TO USE THIS TOOL**:
+    - User asks for: "dance", "play", "express X emotion", "climb", "stretch", "get tired"
+    - User wants: Multiple movements combined into one action
+    - Any narrative/story-like behavior description
+
+    **DO NOT use this for single skill requests** like "sit" or "walk forward" - use bittle_execute_skill instead.
 
     Combine skills and individual motor controls into a choreographed sequence. This is perfect
     for creating dances, expressive movements, or complex multi-step behaviors.
@@ -369,38 +376,41 @@ async def _impl_sequence_motion(sequence: list[dict], repeat: int = 1) -> dict:
     Args:
         sequence: A list of motion step dictionaries. Each step is one of:
             Skill step: {"skill": "skill_name", "duration": 0.5}
-                - Executes a predefined skill like 'walk_forward', 'trot_left', etc.
+                - Executes a predefined skill like 'walk_forward', 'trot_left', 'hop_left_forward', 'joy', etc.
                 - duration (optional): pause after the skill completes (in seconds)
             Motor step: {"motor": "motor_name", "angle": 45, "duration": 0.3}
-                - Moves a specific motor to an angle
+                - Moves a specific motor to an angle (e.g., neck, left_arm, right_arm)
                 - duration: how long the movement takes (in seconds)
         repeat: How many times to repeat the entire sequence (default: 1).
-            - repeat=1: Execute once
-            - repeat=2: Execute twice in a row
-            - repeat=3+: Multiple repetitions for looped behaviors
 
     Returns:
         dict with 'success' (bool), 'sequence_id' (str), 'steps_executed' (int), 'message' (str).
 
-    Examples:
-        Dance sequence:
-        [
-            {"skill": "stand"},
-            {"skill": "walk_forward", "duration": 1.0},
-            {"motor": "neck", "angle": -30, "duration": 0.3},
-            {"motor": "neck", "angle": 30, "duration": 0.3},
-            {"skill": "trot_left", "duration": 0.5},
-            {"skill": "trot_right", "duration": 0.5},
-            {"skill": "sit"}
-        ]
+    Examples - DANCE (narrative request):
+    [
+        {"skill": "stand"},
+        {"skill": "walk_forward", "duration": 1.0},
+        {"skill": "trot_left", "duration": 0.5},
+        {"skill": "trot_right", "duration": 0.5},
+        {"skill": "joy"},
+        {"skill": "sit"}
+    ]
 
-        Confusing gesture:
-        [
-            {"motor": "neck", "angle": 45, "duration": 0.2},
-            {"motor": "neck", "angle": -45, "duration": 0.2},
-            {"motor": "left_arm", "angle": -30, "duration": 0.2},
-            {"motor": "right_arm", "angle": 30, "duration": 0.2}
-        ]
+    Examples - LOOK AROUND (emotion/gesture):
+    [
+        {"motor": "neck", "angle": -45, "duration": 0.3},
+        {"motor": "neck", "angle": 45, "duration": 0.3},
+        {"motor": "neck", "angle": 0, "duration": 0.3}
+    ]
+
+    Examples - GET EXCITED (compound emotion):
+    [
+        {"skill": "stand"},
+        {"skill": "joy"},
+        {"skill": "hop_left_forward", "duration": 0.5},
+        {"skill": "hop_left_left", "duration": 0.5},
+        {"skill": "bark"}
+    ]
     """
     controller = _current_controller
     if not controller:
@@ -454,7 +464,15 @@ class LLMBittleController:
         global _current_controller
         self.bittle = BittleBLEController(address=bittle_address, command_delay=0.05)
         backend = OllamaModelBackend(model_id="granite4.2:3b")
+
+        # Use SimpleContext for now - ChatContext has issues with cycles in async contexts
+        # SimpleContext keeps full history for this session, which is fine for interactive use
         context = SimpleContext()
+
+        # Add system prompt to context - SimpleContext preserves it in the message history
+        system_msg = Message("system", self._get_static_system_prompt())
+        context = context.add(system_msg)
+
         self.mellea = MelleaSession(backend, context)
         _current_controller = self
         self.mellea_tools = self.get_tool_functions()  # Mellea-wrapped tools for LLM
@@ -565,8 +583,9 @@ class LLMBittleController:
 
         return tool_messages
 
-    def get_system_prompt(self) -> str:
-        """Return the system prompt for LLM"""
+    @staticmethod
+    def _get_static_system_prompt() -> str:
+        """Return the system prompt for LLM (static so it can be used in __init__)"""
         return """You are a helpful assistant that controls a Petoi Bittle robot. You have access to tools
 that allow you to make the robot move, execute behaviors, and query its status.
 
@@ -598,28 +617,55 @@ You can control the Bittle robot through the following tools:
 **Recovery**: dropped, lifted
 **Maintenance**: calibrate
 
-## Guidelines
+## How to Handle User Requests
 
-- Always be cautious with motor commands to avoid damaging the robot
-- Motor angles must be between -90° and +90°
-- Skills are the safest way to make the robot move - use them when possible
-- Use motor control for fine adjustments or creative animations
-- Always check robot status before executing complex sequences
-- If the user asks for impossible movements, explain why and suggest alternatives
+**For simple requests** (single movements): Use the appropriate skill directly.
+  Example: "Make the robot sit" → Call bittle_execute_skill("sit")
 
-## Natural Language Understanding
+**For complex/narrative requests** (sequences of movements): ALWAYS use bittle_sequence_motion tool to create a choreographed sequence. DO NOT check status first - just execute the sequence.
+  Example: "Make the robot dance" → Create and execute a sequence:
+    [
+      {"skill": "stand"},
+      {"skill": "walk_forward", "duration": 1.0},
+      {"skill": "trot_left", "duration": 0.5},
+      {"skill": "trot_right", "duration": 0.5},
+      {"skill": "sit"}
+    ]
 
-Interpret user requests creatively:
-- "Look around" → Move neck left and right
-- "Dance" → Combine walking_forward, trot_left, and other gaits
-- "Express confusion" → Use tilt_forward and head movements
-- "Get tired" → Transition from walking to rest
-- "Play dead" → Use dropped skill
-- "Climb" → Use climb_ceiling skill
-- "Be excited" → Use joy and hopping skills together
+**CRITICAL INSTRUCTION**:
+- When a user asks for ANY narrative action (dance, play dead, climb, stretch, get tired, etc.), IMMEDIATELY call bittle_sequence_motion with a sequence.
+- DO NOT call bittle_get_status first for narrative requests - go straight to executing the sequence.
+- DO NOT call bittle_execute_skill multiple times - use bittle_sequence_motion for multi-step movements.
+- Check status ONLY if the user specifically asks "is the robot connected?" or if a sequence fails.
+
+## Narrative-to-Sequence Mapping
+
+Convert these narrative requests into multi-skill sequences:
+
+- **"Dance"** → stand → walk_forward → trot_left → trot_right → walk_backward → sit
+- **"Play dead"** → dropped (or custom motor sequence for dying motion)
+- **"Look around"** → [motor neck left] → [motor neck right] → [motor neck center]
+- **"Be excited"** → stand → joy → hop_left_forward → hop_left_left → bark
+- **"Climb something"** → stand → climb_ceiling → rest
+- **"Stretch"** → stand → stretch → balance → rest
+- **"Crawl forward"** → crawl_forward (multiple calls with pauses)
+- **"Get tired"** → walk_forward → walk_backward → rest → sleep
+- **"Say hello"** → stand → high → check → bark_forward
+
+## Tool Usage Guidelines
+
+- **bittle_execute_skill**: Use for single simple movements
+- **bittle_sequence_motion**: Use for anything complex, multi-step, or narrative. ALWAYS use this for user stories/emotions.
+- **bittle_control_motor**: Only for fine adjustments or when a skill doesn't cover the movement
+- **bittle_beep**: Add audio feedback to sequences when appropriate
+- **bittle_get_status**: Check before complex sequences
 
 ## Safety First
 
+- Always be cautious with motor commands to avoid damaging the robot
+- Motor angles must be between -90° and +90°
+- Skills are safer than motor commands - prefer skills when possible
+- Always check robot status before executing complex sequences
 - Before executing new motions, check the robot is connected
 - Avoid extreme angles or rapid movements that could strain servos
 - Respect the robot's physical limitations
@@ -687,7 +733,8 @@ Interpret user requests creatively:
                 logging.debug("No tool calls requested by LLM")
                 response_text = str(response.value)
 
-            # Update stored context
+            # Update stored context for SimpleContext
+            # (ChatContext would manage this automatically, but we're using SimpleContext for async stability)
             self.mellea._ctx = ctx
 
             return response_text
