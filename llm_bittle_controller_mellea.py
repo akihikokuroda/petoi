@@ -58,12 +58,24 @@ async def _impl_execute_skill(skill_name: str) -> dict:
 
     Args:
         skill_name: The name of the skill to execute. Valid skills are:
-            - sit, stand, sleep, rest, idle: Basic postures
-            - walk_forward, walk_backward, walk_left, walk_right: Walking gaits
-            - trot_forward, trot_backward, trot_left, trot_right: Trotting gaits
-            - balance: Balance and stabilization
-            - stretch: Full body stretch
-            - pee, pick_up_left, pick_up_right: Fun/specialty behaviors
+            - Basic postures: sit, stand, rest, sleep, idle, zero
+            - Walking gaits: walk_forward, walk_backward, walk_left, walk_right
+            - Trotting gaits: trot_forward, trot_backward, trot_left, trot_right
+            - Crawling: crawl_forward, crawl_left
+            - Balance: balance, high
+            - Stretching: stretch
+            - Climbing: climb_ceiling
+            - Recovery: dropped, lifted
+            - Movement: step, tilt_forward, tilt, roll_left, roll, right_turn
+            - Behavioral: pee, pick_up_left, pick_up_right, check, purr, bark_forward, bark
+            - Mecha: mech_forward, mech_left
+            - Hopping: hop_left_forward, hop_left_left
+            - Pedaling: pedal_forward, pedal_left
+            - Tricks: flip, flip_down
+            - Emotions: joy
+            - Phase shifts: phase_forward, phase_left
+            - Rolling: roll_forward, roll_left, roll_right
+            - Calibration: calibrate
 
     Returns:
         dict with 'success' (bool), 'skill' (str), and 'message' (str).
@@ -73,6 +85,8 @@ async def _impl_execute_skill(skill_name: str) -> dict:
         - To make the robot stand: use 'stand'
         - To make it walk forward: use 'walk_forward'
         - To make it dance: combine 'walk_forward' and 'trot_left' in a sequence
+        - To make it hop: use 'hop_left_forward'
+        - To make it climb: use 'climb_ceiling'
     """
     controller = _current_controller
     if not controller:
@@ -559,12 +573,30 @@ that allow you to make the robot move, execute behaviors, and query its status.
 ## Core Capabilities
 
 You can control the Bittle robot through the following tools:
-1. Execute predefined skills (sit, stand, walk, etc.)
+1. Execute predefined skills (over 50+ different movements and behaviors)
 2. Control individual servo motors for precise movements
-3. Create custom motion sequences
+3. Create custom motion sequences and choreography
 4. Query robot status and battery level
-5. Make the robot beep for feedback
+5. Make the robot beep for audio feedback
 6. Calibrate motors to neutral positions
+
+## Available Skills by Category
+
+**Basic Postures**: sit, stand, rest, sleep, idle, zero
+**Walking**: walk_forward, walk_backward, walk_left, walk_right
+**Trotting**: trot_forward, trot_backward, trot_left, trot_right
+**Crawling**: crawl_forward, crawl_left
+**Hopping**: hop_left_forward, hop_left_left
+**Climbing**: climb_ceiling
+**Rolling**: roll, roll_forward, roll_left, roll_right, roll_left
+**Pedaling**: pedal_forward, pedal_left
+**Tricks & Flips**: flip, flip_down
+**Movement**: step, tilt_forward, tilt, right_turn, balance, high, stretch
+**Behavioral**: pee, pick_up_left, pick_up_right, check, purr, bark_forward, bark, joy
+**Mecha Skills**: mech_forward, mech_left
+**Phase Skills**: phase_forward, phase_left
+**Recovery**: dropped, lifted
+**Maintenance**: calibrate
 
 ## Guidelines
 
@@ -579,12 +611,12 @@ You can control the Bittle robot through the following tools:
 
 Interpret user requests creatively:
 - "Look around" → Move neck left and right
-- "Dance" → Combine walking and trotting motions
-- "Express confusion" → Tilt neck and adjust arms
-- "Get tired" → Transition from walking to sitting down
-
-When users describe emotions or actions, break them down into robot movements that
-express those concepts.
+- "Dance" → Combine walking_forward, trot_left, and other gaits
+- "Express confusion" → Use tilt_forward and head movements
+- "Get tired" → Transition from walking to rest
+- "Play dead" → Use dropped skill
+- "Climb" → Use climb_ceiling skill
+- "Be excited" → Use joy and hopping skills together
 
 ## Safety First
 

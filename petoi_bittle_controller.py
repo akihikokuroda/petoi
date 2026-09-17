@@ -30,24 +30,89 @@ class CommandType(Enum):
 
 # Common skills for Bittle
 SKILLS = {
+    # Basic postures
     "sit": "ksit",
     "stand": "kstand",
+    "rest": "krest",
+    "sleep": "ksleep",
+    "idle": "kidle",
+    "zero": "kzero",
+
+    # Walking gaits
     "walk_forward": "kwkF",
     "walk_backward": "kwkB",
     "walk_left": "kwkL",
     "walk_right": "kwkR",
+
+    # Trotting gaits
     "trot_forward": "ktrF",
     "trot_backward": "ktrB",
     "trot_left": "ktrL",
     "trot_right": "ktrR",
+
+    # Crawling gaits
+    "crawl_forward": "kcrF",
+    "crawl_left": "kcrL",
+
+    # Balance and movement
     "balance": "kbalance",
-    "stretch": "kstretch",
+
+    # Stretching and postures
+    "stretch": "kstr",
+    "high": "khi",
+
+    # Climbing
+    "climb_ceiling": "kclimbCeil",
+
+    # Falling and recovery
+    "dropped": "kdropped",
+    "lifted": "klifted",
+
+    # Behavioral skills
     "pee": "kpee",
-    "rest": "krest",
-    "sleep": "ksleep",
-    "idle": "kidle",
-    "pick_up_left": "kpickUpL",
-    "pick_up_right": "kpickUpR",
+    "pick_up_left": "kpu1",  # pu1 = pick up left
+    "pick_up_right": "kpu",   # pu = pick up (right)
+    "purr": "kpurr",
+    "check": "kck",
+    "bark_forward": "kbf",
+    "bark": "kbk",
+
+    # Movement skills
+    "step": "kstep",
+    "tilt_forward": "ktf",
+    "tilt": "ktilt",
+    "roll_left": "krlL",
+    "roll": "krl",
+    "right_turn": "krt",
+    "calibrate": "kcalib",
+
+    # Extended movement (Mecha)
+    "mech_forward": "kmhF",
+    "mech_left": "kmhL",
+
+    # Hopping skills
+    "hop_left_forward": "khlwF",
+    "hop_left_left": "khlwL",
+
+    # Pedaling/Cycling
+    "pedal_forward": "kpdF",
+    "pedal_left": "kpdL",
+
+    # Flip and tricks
+    "flip": "kff",
+    "flip_down": "kfd",
+
+    # Joy and excitement
+    "joy": "kjy",
+
+    # Phase shifts (body parts specific)
+    "phase_forward": "kphF",
+    "phase_left": "kphL",
+
+    # Roll and composite movements
+    "roll_forward": "krF",
+    "roll_left": "krL",
+    "roll_right": "krR",
 }
 
 # Motor indices and descriptions for Bittle X
