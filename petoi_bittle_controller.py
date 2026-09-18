@@ -8,8 +8,10 @@ Based on: https://github.com/akihikokuroda/petoi/blob/main/bluetooth_testSkills.
 
 import asyncio
 import sys
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 from enum import Enum
+from dataclasses import dataclass, field
+from datetime import datetime
 
 try:
     from bleak import BleakClient, BleakScanner
@@ -26,6 +28,57 @@ class CommandType(Enum):
     VOLTAGE = "v"
     QUIT = "q"
     BEEP = "b"
+    READ = "R"
+
+
+@dataclass
+class LightSensorReading:
+    """Light sensor data (e.g., TCS34725 or similar)."""
+    timestamp: datetime = field(default_factory=lambda: datetime.now())
+    lux: Optional[float] = None
+    red: Optional[int] = None
+    green: Optional[int] = None
+    blue: Optional[int] = None
+    color_temperature: Optional[float] = None
+    brightness: Optional[int] = None
+    raw_value: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "lux": self.lux,
+            "red": self.red,
+            "green": self.green,
+            "blue": self.blue,
+            "color_temperature": self.color_temperature,
+            "brightness": self.brightness,
+            "raw_value": self.raw_value,
+        }
+
+
+@dataclass
+class IMUSensorReading:
+    """IMU sensor data (accelerometer and gyroscope)."""
+    timestamp: datetime = field(default_factory=lambda: datetime.now())
+    accel_x: Optional[float] = None
+    accel_y: Optional[float] = None
+    accel_z: Optional[float] = None
+    gyro_x: Optional[float] = None
+    gyro_y: Optional[float] = None
+    gyro_z: Optional[float] = None
+    raw_value: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "accel_x": self.accel_x,
+            "accel_y": self.accel_y,
+            "accel_z": self.accel_z,
+            "gyro_x": self.gyro_x,
+            "gyro_y": self.gyro_y,
+            "gyro_z": self.gyro_z,
+            "raw_value": self.raw_value,
+        }
 
 
 # Common skills for Bittle
@@ -146,6 +199,11 @@ class BittleBLEController:
         self.client: Optional[BleakClient] = None
         self.char = None
         self.connected = False
+        self.last_light_reading: Optional[LightSensorReading] = None
+        self.last_imu_reading: Optional[IMUSensorReading] = None
+        self.sensor_response_queue: asyncio.Queue = asyncio.Queue()
+        self.imu_response_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+        self.notify_char = None
 
     async def discover_bittle(self) -> Optional[str]:
         """
@@ -191,6 +249,45 @@ class BittleBLEController:
             print(f"❌ Failed to find characteristic: {e}")
             return None
 
+    async def find_notify_characteristic(self):
+        """
+        Scan GATT services to find a notify characteristic for responses.
+
+        Returns:
+            Characteristic object or None.
+        """
+        try:
+            for service in self.client.services:
+                for char in service.characteristics:
+                    if "notify" in char.properties or "read" in char.properties:
+                        print(f"Found readable characteristic: {char.uuid}")
+                        return char
+            return None
+        except Exception as e:
+            print(f"❌ Failed to find notify characteristic: {e}")
+            return None
+
+    def _notification_handler(self, sender, data):
+        """Handle incoming BLE notifications."""
+        try:
+            response = data.decode("utf-8").strip()
+            if not response:
+                return
+
+            # Ignore handshake/info messages and echo replies
+            if response in ("Petoi Bittle", "Bittle55_SSP", "p", "k", "R"):
+                return
+
+            # Check if this is IMU data
+            if response.startswith("ICM:"):
+                print(f"← Received IMU: {response}")
+                asyncio.create_task(self.imu_response_queue.put(response))
+            else:
+                print(f"← Received: {repr(response)}")
+                asyncio.create_task(self.sensor_response_queue.put(response))
+        except Exception as e:
+            print(f"Error decoding notification: {e}")
+
     async def connect(self) -> bool:
         """
         Connect to the Bittle robot via Bluetooth LE.
@@ -217,6 +314,12 @@ class BittleBLEController:
                 await self.disconnect()
                 return False
 
+            # Find notify characteristic for responses
+            self.notify_char = await self.find_notify_characteristic()
+            if self.notify_char and "notify" in self.notify_char.properties:
+                await self.client.start_notify(self.notify_char, self._notification_handler)
+                print(f"Notification handler enabled")
+
             await asyncio.sleep(0.5)
             return True
         except Exception as e:
@@ -227,6 +330,8 @@ class BittleBLEController:
         """Disconnect from the Bittle."""
         if self.client:
             try:
+                if self.notify_char:
+                    await self.client.stop_notify(self.notify_char)
                 await self.client.disconnect()
             except Exception:
                 pass
@@ -307,6 +412,219 @@ class BittleBLEController:
         cmd = self.build_skill_command(skill)
         return await self.send_command(cmd)
 
+    async def activate_light_mode(self) -> bool:
+        """Activate light sensor mode on Bittle XL."""
+        print("Activating light mode...")
+        return await self.send_command("XL")
+
+    async def deactivate_light_mode(self) -> bool:
+        """Deactivate light sensor mode on Bittle XL."""
+        print("Deactivating light mode...")
+        return await self.send_command("Xl")
+
+    async def read_light_sensor(self, command: str = "Ra36", timeout: float = 2.0) -> Optional[LightSensorReading]:
+        """
+        Read light sensor data from Bittle.
+        Sends command and waits for response (format: varies by command).
+
+        Args:
+            command: Sensor command to send (default: "l")
+            timeout: Response timeout in seconds (default: 2.0)
+        """
+        if not self.connected or not self.client or not self.char:
+            print("❌ Not connected to Bittle")
+            return None
+
+        try:
+            print(f"Reading light sensor with command: '{command}'")
+            await self.send_command(command)
+
+            # Add small delay to let fragments accumulate
+            await asyncio.sleep(0.3)
+
+            # Drain queue to get all accumulated responses
+            responses = []
+            while not self.sensor_response_queue.empty():
+                try:
+                    response = self.sensor_response_queue.get_nowait()
+                    responses.append(response)
+                except asyncio.QueueEmpty:
+                    break
+
+            if responses:
+                # Join without spaces to preserve format like "=0"
+                combined = "".join(responses)
+                print(f"Raw responses: {responses}")
+                print(f"Combined: {repr(combined)}")
+                return await self.parse_light_sensor_response(combined)
+            else:
+                print(f"⚠ No response received for command '{command}'")
+                return None
+        except Exception as e:
+            print(f"❌ Failed to read light sensor: {e}")
+            return None
+
+    async def parse_light_sensor_response(self, response: str) -> Optional[LightSensorReading]:
+        """
+        Parse light sensor response from Bittle.
+        Formats:
+        - Analog read: "=<value>" (e.g., "=512")
+        - CSV format: "lux,red,green,blue,cct,brightness"
+        """
+        try:
+            response = response.strip()
+
+            # Handle analog read format: =value or =value=
+            if response.startswith("="):
+                try:
+                    # Remove leading and trailing '='
+                    value_str = response[1:].rstrip("=")
+                    value = int(value_str)
+                    reading = LightSensorReading(
+                        brightness=value,
+                        raw_value=response,
+                    )
+                    self.last_light_reading = reading
+                    print(f"✓ Parsed analog value: {value}")
+                    return reading
+                except ValueError:
+                    print(f"❌ Invalid analog value: {response}")
+                    return None
+
+            # Handle CSV format: lux,red,green,blue,cct,brightness
+            parts = response.split(",")
+            if len(parts) >= 6:
+                reading = LightSensorReading(
+                    lux=float(parts[0]),
+                    red=int(parts[1]),
+                    green=int(parts[2]),
+                    blue=int(parts[3]),
+                    color_temperature=float(parts[4]),
+                    brightness=int(parts[5]),
+                    raw_value=response,
+                )
+                self.last_light_reading = reading
+                return reading
+
+            print(f"❌ Unrecognized sensor response format: {response}")
+            return None
+        except (ValueError, IndexError) as e:
+            print(f"❌ Failed to parse sensor response: {e}")
+            return None
+
+    def get_last_light_reading(self) -> Optional[LightSensorReading]:
+        """Get the last recorded light sensor reading."""
+        return self.last_light_reading
+
+    async def read_imu_sensor(self, timeout: float = 2.0) -> Optional[IMUSensorReading]:
+        """
+        Read IMU data from Bittle (broadcasts automatically).
+        Waits for the next available IMU reading.
+
+        Args:
+            timeout: Wait timeout in seconds (default: 2.0)
+        """
+        if not self.connected:
+            print("❌ Not connected to Bittle")
+            return None
+
+        try:
+            # Wait for IMU data with timeout
+            response = await asyncio.wait_for(
+                self.imu_response_queue.get(),
+                timeout=timeout
+            )
+            return await self.parse_imu_response(response)
+        except asyncio.TimeoutError:
+            print(f"⚠ No IMU data received (waited {timeout}s)")
+            print("  Bittle broadcasts IMU data continuously")
+            print("  Current issue: No IMU data in buffer")
+            return None
+        except Exception as e:
+            print(f"❌ Failed to read IMU: {e}")
+            return None
+
+    async def parse_imu_response(self, response: str) -> Optional[IMUSensorReading]:
+        """
+        Parse IMU response from Bittle.
+        Expected format: "ICM:  accel_x  accel_y  accel_z gyro_x  gyro_y  gyro_z"
+        Example: "ICM:  -7.5  -2.9 100.0 -141.2   -4.2   -1.8"
+        """
+        try:
+            if not response.startswith("ICM:"):
+                return None
+
+            parts = response.replace("ICM:", "").split()
+            parts = [p for p in parts if p]
+
+            if len(parts) < 6:
+                return None
+
+            reading = IMUSensorReading(
+                accel_x=float(parts[0]),
+                accel_y=float(parts[1]),
+                accel_z=float(parts[2]),
+                gyro_x=float(parts[3]),
+                gyro_y=float(parts[4]),
+                gyro_z=float(parts[5]),
+                raw_value=response,
+            )
+            self.last_imu_reading = reading
+            return reading
+        except Exception as e:
+            print(f"❌ Failed to parse IMU: {response[:50]} - Error: {e}")
+            return None
+
+    def get_last_imu_reading(self) -> Optional[IMUSensorReading]:
+        """Get the last recorded IMU reading."""
+        return self.last_imu_reading
+
+    def print_light_reading(self, reading: Optional[LightSensorReading] = None):
+        """Pretty print light sensor reading."""
+        if reading is None:
+            reading = self.last_light_reading
+        if reading is None:
+            print("❌ No light sensor reading available")
+            return
+
+        print("\n" + "=" * 60)
+        print("LIGHT SENSOR READING")
+        print("=" * 60)
+        print(f"  Timestamp:        {reading.timestamp.isoformat()}")
+        print(f"  Illuminance (Lux):{reading.lux if reading.lux is not None else 'N/A':>35}")
+        print(f"  Brightness:       {reading.brightness if reading.brightness is not None else 'N/A':>35}")
+        print(f"  Color Temp (K):   {reading.color_temperature if reading.color_temperature is not None else 'N/A':>35}")
+        print(f"  Red:              {reading.red if reading.red is not None else 'N/A':>35}")
+        print(f"  Green:            {reading.green if reading.green is not None else 'N/A':>35}")
+        print(f"  Blue:             {reading.blue if reading.blue is not None else 'N/A':>35}")
+        if reading.raw_value:
+            print(f"  Raw Response:     {reading.raw_value}")
+        print("=" * 60 + "\n")
+
+    def print_imu_reading(self, reading: Optional[IMUSensorReading] = None):
+        """Pretty print IMU sensor reading."""
+        if reading is None:
+            reading = self.last_imu_reading
+        if reading is None:
+            print("❌ No IMU reading available")
+            return
+
+        print("\n" + "=" * 60)
+        print("IMU SENSOR READING (Accelerometer & Gyroscope)")
+        print("=" * 60)
+        print(f"  Timestamp:        {reading.timestamp.isoformat()}")
+        print("  Accelerometer (m/s²):")
+        print(f"    X: {reading.accel_x if reading.accel_x is not None else 'N/A':>40.1f}")
+        print(f"    Y: {reading.accel_y if reading.accel_y is not None else 'N/A':>40.1f}")
+        print(f"    Z: {reading.accel_z if reading.accel_z is not None else 'N/A':>40.1f}")
+        print("  Gyroscope (°/s):")
+        print(f"    X: {reading.gyro_x if reading.gyro_x is not None else 'N/A':>40.1f}")
+        print(f"    Y: {reading.gyro_y if reading.gyro_y is not None else 'N/A':>40.1f}")
+        print(f"    Z: {reading.gyro_z if reading.gyro_z is not None else 'N/A':>40.1f}")
+        if reading.raw_value:
+            print(f"  Raw: {reading.raw_value}")
+        print("=" * 60 + "\n")
+
 
 def show_help():
     """Display help information."""
@@ -318,6 +636,10 @@ def show_help():
 COMMAND SYNTAX:
   motor <index> <angle>     - Control servo motor
   skill <name>              - Execute a predefined skill
+  imu                       - Read IMU sensor (accelerometer/gyroscope)
+  light                     - Read light sensor
+  light_on                  - Activate light sensor mode (XL)
+  light_off                 - Deactivate light sensor mode (Xl)
   help                      - Show this help
   motors                    - List all motors
   skills                    - List all skills
@@ -334,9 +656,15 @@ SKILL EXAMPLES:
   skill walk_forward        - Walk forward
   skill trot_left           - Trot left
 
+SENSOR EXAMPLES:
+  imu                       - Read IMU (accel/gyro data)
+  light                     - Read light sensor (lux, RGB, color temp)
+  light R                   - Read sensor (R = read pin R)
+  light l                   - Try sensor command 'l'
+
 DIRECT COMMANDS:
   Send raw Petoi commands directly:
-  ksit, kwkF, m0 30, c10 5, etc.
+  ksit, kwkF, m0 30, c10 5, s, etc.
 
 TYPE 'help' or 'motors' or 'skills' for more information.
 """
@@ -396,6 +724,23 @@ async def interactive_loop(controller: BittleBLEController):
 
             elif command == "skills":
                 show_skills()
+
+            elif command == "imu":
+                reading = await controller.read_imu_sensor()
+                if reading:
+                    controller.print_imu_reading(reading)
+
+            elif command == "light":
+                sensor_cmd = parts[1] if len(parts) > 1 else "Ra36"
+                reading = await controller.read_light_sensor(command=sensor_cmd)
+                if reading:
+                    controller.print_light_reading(reading)
+
+            elif command == "light_on":
+                await controller.activate_light_mode()
+
+            elif command == "light_off":
+                await controller.deactivate_light_mode()
 
             elif command == "motor":
                 if len(parts) < 3:
