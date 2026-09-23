@@ -182,6 +182,17 @@ MOTOR_INDICES = {
     15: "Left ankle",
 }
 
+PIN_CHAR_MAP = {
+    '"': 34,
+    '#': 35,
+    '$': 36,
+    '%': 37,
+    '&': 38,
+    "'": 39,
+    'a': 97,
+    'd': 100,
+}
+
 
 class BittleBLEController:
     """Main controller for Petoi Bittle robot via Bluetooth LE."""
@@ -422,7 +433,26 @@ class BittleBLEController:
         print("Deactivating light mode...")
         return await self.send_command("Xl")
 
-    async def read_light_sensor(self, command: str = "Ra36", timeout: float = 2.0) -> Optional[LightSensorReading]:
+    def resolve_light_command(self, cmd: str) -> str:
+        """Resolves a light command, allowing shorthand characters."""
+        if cmd.startswith("Ra"):
+            return cmd
+
+        # If it's a single character from the map, prepend 'Ra'
+        if len(cmd) == 1 and cmd in PIN_CHAR_MAP:
+            return f"Ra{cmd}"
+
+        # If it's a number, convert to character and prepend 'Ra'
+        if cmd.isdigit():
+            pin = int(cmd)
+            for char, p in PIN_CHAR_MAP.items():
+                if p == pin:
+                    return f"Ra{char}"
+            return f"Ra{cmd}"  # Fallback if pin not in map
+
+        return cmd
+
+    async def read_light_sensor(self, command: str = "Ra$", timeout: float = 2.0) -> Optional[LightSensorReading]:
         """
         Read light sensor data from Bittle.
         Sends command and waits for response (format: varies by command).
@@ -731,7 +761,8 @@ async def interactive_loop(controller: BittleBLEController):
                     controller.print_imu_reading(reading)
 
             elif command == "light":
-                sensor_cmd = parts[1] if len(parts) > 1 else "Ra36"
+                sensor_cmd = parts[1] if len(parts) > 1 else "Ra$"
+                sensor_cmd = controller.resolve_light_command(sensor_cmd)
                 reading = await controller.read_light_sensor(command=sensor_cmd)
                 if reading:
                     controller.print_light_reading(reading)
