@@ -8,6 +8,7 @@ Based on: https://github.com/akihikokuroda/petoi/blob/main/bluetooth_testSkills.
 
 import asyncio
 import sys
+import re
 from typing import Optional, Tuple, Dict, Any
 from enum import Enum
 from dataclasses import dataclass, field
@@ -79,6 +80,43 @@ class IMUSensorReading:
             "gyro_z": self.gyro_z,
             "raw_value": self.raw_value,
         }
+
+
+@dataclass
+class GestureSensorReading:
+    """Gesture sensor data.
+
+    value: -1 No gesture detected; 0 Up; 1 Down; 2 Left; 3 Right.
+    """
+    timestamp: datetime = field(default_factory=lambda: datetime.now())
+    value: Optional[int] = None
+    gesture: Optional[str] = None
+    raw_value: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "value": self.value,
+            "gesture": self.gesture,
+            "raw_value": self.raw_value,
+        }
+
+
+# Gesture value mapping (same as readGestureVal in PetoiRobot/robot.py)
+GESTURE_VALUE_NAMES = {
+    -1: "no gesture",
+    0: "up",
+    1: "down",
+    2: "left",
+    3: "right",
+}
+
+# Index of the Gesture flag in the module-status list (moduleList in
+# src/OpenCat.h: Grove_Serial, Voice, Double_Touch, Double_Light,
+# Double_IR_Distance, PIR, BackTouch, Ultrasonic, Gesture, Camera, Quick_Demo)
+# NOTE: that list is printed with Serial.print (USB only) and is NOT
+# received over BLE — see activate_gesture_mode().
+GESTURE_MODE_FLAG_INDEX = 8
 
 
 # Common skills for Bittle
@@ -212,6 +250,8 @@ class BittleBLEController:
         self.connected = False
         self.last_light_reading: Optional[LightSensorReading] = None
         self.last_imu_reading: Optional[IMUSensorReading] = None
+        self.last_gesture_reading: Optional[GestureSensorReading] = None
+        self.gesture_mode_active: bool = False
         self.sensor_response_queue: asyncio.Queue = asyncio.Queue()
         self.imu_response_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
         self.notify_char = None
@@ -286,7 +326,8 @@ class BittleBLEController:
                 return
 
             # Ignore handshake/info messages and echo replies
-            if response in ("Petoi Bittle", "Bittle55_SSP", "p", "k", "R"):
+            # ('X'/'G' are command-completion echoes; gesture values are digits)
+            if response in ("Petoi Bittle", "Bittle55_SSP", "p", "k", "R", "X", "G"):
                 return
 
             # Check if this is IMU data
@@ -609,6 +650,159 @@ class BittleBLEController:
         """Get the last recorded IMU reading."""
         return self.last_imu_reading
 
+    async def activate_gesture_mode(self, reactions: bool = False) -> bool:
+        """Enable the gesture module and start the continuous value stream.
+
+        Firmware behavior (src/moduleManager.h, src/reaction.h):
+          - "X" + uppercase letter enables that module (and disables the
+            other non-protected modules).
+          - option "P" -> continuous print: every detected gesture value is
+            pushed to the client (0=up 1=down 2=left 3=right).
+          - option "r" -> turn the automatic reactions (sit/scratch/head
+            turn) OFF; "R" -> leave them ON.
+
+        So "XGPr" (default) = module on + value stream + robot stays still,
+        which is what you want for reading. "XGPR" = same but the dog
+        reacts to each gesture (sit/scratch/head turn) as well.
+
+        Note: the module status list the robot prints on activation
+        (showModuleStatus) goes to the USB serial port only, so it never
+        arrives over BLE — a successful write is our confirmation here.
+        """
+        if not self.connected or not self.client or not self.char:
+            print("❌ Not connected to Bittle")
+            return False
+
+        cmd = "XGPR" if reactions else "XGPr"
+        note = "reactions ON (dog will sit/scratch/turn head)" if reactions \
+            else "reactions OFF (dog stays still)"
+        print(f"Activating gesture mode ({cmd}) — continuous value stream, {note}")
+        if not await self.send_command(cmd):
+            return False
+
+        self.gesture_mode_active = True
+        print("✓ Gesture mode active — wave your hand in front of the sensor")
+        return True
+
+    async def deactivate_gesture_mode(self) -> bool:
+        """Disable the gesture module (Xg) and stop the value stream."""
+        if not self.connected or not self.client or not self.char:
+            print("❌ Not connected to Bittle")
+            return False
+
+        print("Deactivating gesture mode (Xg)...")
+        if not await self.send_command("Xg"):
+            return False
+
+        self.gesture_mode_active = False
+        print("✓ Gesture mode deactivated")
+        return True
+
+    def _gesture_flag_active(self, response: str) -> bool:
+        """Check the Gesture flag (index 8) in a module-status list response.
+
+        Only useful over USB serial — the list is not sent over BLE.
+        """
+        pattern = re.compile(r'^(?=.*[01])(?=.*,).+$', flags=re.MULTILINE)
+        for line in pattern.findall(response):
+            line = line.replace('\t', '').replace('\r', '').replace('\n', '').strip()
+            try:
+                flags = [int(x) for x in line.split(',')[:-1]]
+            except ValueError:
+                continue
+            if len(flags) > GESTURE_MODE_FLAG_INDEX and flags[GESTURE_MODE_FLAG_INDEX] == 1:
+                return True
+        return False
+
+    def _is_gesture_value(self, message: str) -> bool:
+        """True if this BLE message is a pushed gesture value (-1..3)."""
+        if not re.fullmatch(r"-?\d+", message):
+            return False
+        return int(message) in GESTURE_VALUE_NAMES
+
+    async def read_gesture_sensor(self, timeout: float = 10.0) -> Optional[GestureSensorReading]:
+        """
+        Read one gesture value from the Bittle.
+
+        Value meaning: -1 No gesture; 0 Up; 1 Down; 2 Left; 3 Right.
+
+        While the gesture module runs in continuous print mode (XGP), the
+        firmware pushes every detected value to the client, so this method
+        enables the stream if needed, then waits up to `timeout` seconds
+        for a pushed value, skipping unrelated traffic on the BLE channel.
+        (A one-shot "XGp" read is unreliable: once the module is enabled
+        the robot's main loop consumes detected gestures every iteration,
+        so XGp almost always returns -1.)
+
+        Wave your hand in front of the sensor while it is waiting.
+
+        Args:
+            timeout: How long to wait for a gesture, in seconds
+        """
+        if not self.connected or not self.client or not self.char:
+            print("❌ Not connected to Bittle")
+            return None
+
+        if not self.gesture_mode_active:
+            if not await self.activate_gesture_mode():
+                return None
+
+        # Drop stale messages left over from earlier commands
+        while not self.sensor_response_queue.empty():
+            try:
+                self.sensor_response_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        print(f"Waiting for a gesture — wave your hand now... ({timeout:.0f}s)")
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                print("⚠ No gesture detected in time")
+                print("  Keep your hand within ~20cm of the sensor and move it clearly")
+                return None
+            try:
+                message = await asyncio.wait_for(
+                    self.sensor_response_queue.get(), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                print("⚠ No gesture detected in time")
+                return None
+            if self._is_gesture_value(message):
+                return self.parse_gesture_response(message)
+            # anything else (reaction echoes, status text, ...) is ignored
+
+    def parse_gesture_response(self, response: str) -> Optional[GestureSensorReading]:
+        """Parse a gesture value from the Bittle.
+
+        Accepts the streamed bare value ("1") as well as the one-shot
+        "=<value>" reply ("=1"). Values: -1 none, 0 up, 1 down, 2 left,
+        3 right.
+        """
+        try:
+            match = re.search(r"=\s*(-?\d+)|^(-?\d+)$", response.strip())
+            if not match:
+                print(f"❌ No gesture value in response: {response!r}")
+                return None
+            value = int(match.group(1) or match.group(2))
+            if value not in GESTURE_VALUE_NAMES:
+                print(f"❌ Gesture value out of range (-1..3): {value}")
+                return None
+            gesture = GESTURE_VALUE_NAMES[value]
+            reading = GestureSensorReading(value=value, gesture=gesture, raw_value=response)
+            self.last_gesture_reading = reading
+            print(f"✓ Gesture: {gesture} (value={value})")
+            return reading
+        except (ValueError, re.error) as e:
+            print(f"❌ Failed to parse gesture response: {e}")
+            return None
+
+    def get_last_gesture_reading(self) -> Optional[GestureSensorReading]:
+        """Get the last recorded gesture sensor reading."""
+        return self.last_gesture_reading
+
     def print_light_reading(self, reading: Optional[LightSensorReading] = None):
         """Pretty print light sensor reading."""
         if reading is None:
@@ -655,6 +849,25 @@ class BittleBLEController:
             print(f"  Raw: {reading.raw_value}")
         print("=" * 60 + "\n")
 
+    def print_gesture_reading(self, reading: Optional[GestureSensorReading] = None):
+        """Pretty print gesture sensor reading."""
+        if reading is None:
+            reading = self.last_gesture_reading
+        if reading is None:
+            print("❌ No gesture sensor reading available")
+            return
+
+        print("\n" + "=" * 60)
+        print("GESTURE SENSOR READING")
+        print("=" * 60)
+        print(f"  Timestamp:  {reading.timestamp.isoformat()}")
+        print(f"  Value:      {reading.value if reading.value is not None else 'N/A'}")
+        print(f"  Gesture:    {reading.gesture if reading.gesture is not None else 'N/A'}")
+        if reading.raw_value:
+            print(f"  Raw:        {reading.raw_value}")
+        print("  Legend:     -1=none  0=up  1=down  2=left  3=right")
+        print("=" * 60 + "\n")
+
 
 def show_help():
     """Display help information."""
@@ -670,6 +883,10 @@ COMMAND SYNTAX:
   light                     - Read light sensor
   light_on                  - Activate light sensor mode (XL)
   light_off                 - Deactivate light sensor mode (Xl)
+  gesture                   - Read one gesture value (auto-enables stream)
+  gesture_on                - Enable gesture stream, dog stays still (XGPr)
+  gesture_off               - Disable the gesture module (Xg)
+  gesture_react             - Stream + let the dog react (XGPR)
   help                      - Show this help
   motors                    - List all motors
   skills                    - List all skills
@@ -691,6 +908,11 @@ SENSOR EXAMPLES:
   light                     - Read light sensor (lux, RGB, color temp)
   light R                   - Read sensor (R = read pin R)
   light l                   - Try sensor command 'l'
+  gesture                   - Read one gesture (wave your hand while it waits)
+  gesture_on                - Start continuous gesture stream, dog still (XGPr)
+  gesture_off               - Stop the gesture module (Xg)
+  gesture_react             - Stream + let the dog react (XGPR)
+  gesture values:           -1=none 0=up 1=down 2=left 3=right
 
 DIRECT COMMANDS:
   Send raw Petoi commands directly:
@@ -772,6 +994,20 @@ async def interactive_loop(controller: BittleBLEController):
 
             elif command == "light_off":
                 await controller.deactivate_light_mode()
+
+            elif command == "gesture":
+                reading = await controller.read_gesture_sensor()
+                if reading:
+                    controller.print_gesture_reading(reading)
+
+            elif command == "gesture_on":
+                await controller.activate_gesture_mode()
+
+            elif command == "gesture_off":
+                await controller.deactivate_gesture_mode()
+
+            elif command == "gesture_react":
+                await controller.activate_gesture_mode(reactions=True)
 
             elif command == "motor":
                 if len(parts) < 3:
