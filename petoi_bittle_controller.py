@@ -58,6 +58,26 @@ class LightSensorReading:
 
 
 @dataclass
+class DistanceSensorReading:
+    """IR distance sensor (double infrared reflection) data.
+
+    value is the raw analog reading of the sensor pin. On the Petoi IR distance
+    module the raw ADC reading correlates with distance (a closer object gives a
+    different reading). The docs don't publish a fixed unit, so it is kept raw.
+    """
+    timestamp: datetime = field(default_factory=lambda: datetime.now())
+    value: Optional[int] = None
+    raw_value: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "value": self.value,
+            "raw_value": self.raw_value,
+        }
+
+
+@dataclass
 class IMUSensorReading:
     """IMU sensor data (accelerometer and gyroscope)."""
     timestamp: datetime = field(default_factory=lambda: datetime.now())
@@ -229,6 +249,15 @@ LIGHT_PINS = {
     "R": 35,  # right light sensor -> GPIO 35
 }
 
+# IR distance sensor (double infrared reflection) pin mapping.
+# This module has two analog sensors: left on GPIO 34 and right on GPIO 35
+# (BiBoard; A2/A3 on NyBoard). It is read as a plain analog value (Ra + pin),
+# just like the light sensor. The module mode is toggled with 'XD' / 'Xd'.
+DISTANCE_PINS = {
+    "L": 34,  # left  IR distance sensor -> GPIO 34
+    "R": 35,  # right IR distance sensor -> GPIO 35
+}
+
 
 class BittleBLEController:
     """Main controller for Petoi Bittle robot via Bluetooth LE."""
@@ -247,6 +276,7 @@ class BittleBLEController:
         self.char = None
         self.connected = False
         self.last_light_reading: Optional[LightSensorReading] = None
+        self.last_distance_reading: Optional[DistanceSensorReading] = None
         self.last_imu_reading: Optional[IMUSensorReading] = None
         self.last_gesture_reading: Optional[GestureSensorReading] = None
         self.gesture_mode_active: bool = False
@@ -472,6 +502,16 @@ class BittleBLEController:
         print("Deactivating light mode...")
         return await self.send_command("Xl")
 
+    async def activate_distance_mode(self) -> bool:
+        """Activate the IR distance sensor mode (XD)."""
+        print("Activating IR distance mode...")
+        return await self.send_command("XD")
+
+    async def deactivate_distance_mode(self) -> bool:
+        """Deactivate the IR distance sensor mode (Xd)."""
+        print("Deactivating IR distance mode...")
+        return await self.send_command("Xd")
+
     def resolve_light_command(self, cmd: str) -> str:
         """Resolve a light argument to the raw Bittle command to send.
 
@@ -555,6 +595,103 @@ class BittleBLEController:
             await asyncio.sleep(0.3)
         self.print_light_readings(readings)
         return readings
+
+    def resolve_distance_command(self, side: str) -> str:
+        """Resolve a distance side ('L'/'R') to the raw Bittle analog read command.
+
+        The IR distance sensors are read as analog values (Ra + pin), where the
+        pin is sent as the byte whose value equals the pin number (chr(pin)):
+        pin 34 -> Ra"   pin 35 -> Ra#
+        """
+        side = side.upper()
+        if side not in DISTANCE_PINS:
+            return ""
+        return f"Ra{chr(DISTANCE_PINS[side])}"
+
+    async def read_distance_sensor(self, side: str = "L", timeout: float = 2.0) -> Optional[DistanceSensorReading]:
+        """
+        Read one IR distance sensor (left or right).
+
+        Args:
+            side: 'L' or 'R' (see DISTANCE_PINS for the pin).
+            timeout: Response timeout in seconds (default: 2.0).
+        """
+        command = self.resolve_distance_command(side)
+        if not command:
+            print(f"❌ Unknown distance side: '{side}' (expected 'L' or 'R')")
+            return None
+        if not self.connected or not self.client or not self.char:
+            print("❌ Not connected to Bittle")
+            return None
+
+        try:
+            print(f"Reading distance ({side}) with command: '{command}'")
+            await self.send_command(command)
+
+            # Add small delay to let fragments accumulate
+            await asyncio.sleep(0.3)
+
+            # Drain queue to get all accumulated responses
+            responses = []
+            while not self.sensor_response_queue.empty():
+                try:
+                    response = self.sensor_response_queue.get_nowait()
+                    responses.append(response)
+                except asyncio.QueueEmpty:
+                    break
+
+            if responses:
+                combined = "".join(responses)
+                print(f"Raw responses: {responses}")
+                print(f"Combined: {repr(combined)}")
+                return await self.parse_distance_response(combined)
+            else:
+                print(f"⚠ No response received for command '{command}'")
+                return None
+        except Exception as e:
+            print(f"❌ Failed to read distance: {e}")
+            return None
+
+    async def read_distance_sensors(self, timeout: float = 2.0):
+        """Read both distance sensors (left + right) and print them side by side.
+
+        Returns:
+            Dict {'L': DistanceSensorReading | None, 'R': DistanceSensorReading | None}
+        """
+        readings: Dict[str, Optional[DistanceSensorReading]] = {}
+        for side in ("L", "R"):
+            readings[side] = await self.read_distance_sensor(side=side, timeout=timeout)
+            # Small gap so the next command/response pair doesn't bleed into the queue.
+            await asyncio.sleep(0.3)
+        self.print_distance_readings(readings)
+        return readings
+
+    async def parse_distance_response(self, response: str) -> Optional[DistanceSensorReading]:
+        """Parse an IR distance (analog) response.
+
+        Format: '=<value>' where value is the raw analog reading of the sensor
+        pin (e.g. '=512'), the same shape as the light/analog read.
+        """
+        try:
+            response = response.strip()
+            if "=" in response:
+                value_str = response.split("=", 1)[1]
+                value_str = value_str.rstrip("=, \t\r\n").strip()
+                if re.fullmatch(r"\d+", value_str):
+                    reading = DistanceSensorReading(
+                        value=int(value_str),
+                        raw_value=response,
+                    )
+                    self.last_distance_reading = reading
+                    print(f"✓ Parsed distance value: {reading.value}")
+                    return reading
+                print(f"❌ Invalid distance value: {response}")
+                return None
+            print(f"❌ Unrecognized distance response: {response}")
+            return None
+        except Exception as e:
+            print(f"❌ Failed to parse distance response: {e}")
+            return None
 
     async def parse_light_sensor_response(self, response: str) -> Optional[LightSensorReading]:
         """
@@ -863,6 +1000,40 @@ class BittleBLEController:
                     print(f"      raw: {reading.raw_value}")
         print("=" * 60 + "\n")
 
+    def print_distance_reading(self, reading: Optional[DistanceSensorReading] = None):
+        """Pretty print one distance sensor reading."""
+        if reading is None:
+            reading = self.last_distance_reading
+        if reading is None:
+            print("❌ No distance sensor reading available")
+            return
+
+        print("\n" + "=" * 60)
+        print("DISTANCE SENSOR READING")
+        print("=" * 60)
+        print(f"  Timestamp:          {reading.timestamp.isoformat()}")
+        print(f"  Value (analog):     {reading.value if reading.value is not None else 'N/A':>35}")
+        if reading.raw_value:
+            print(f"  Raw Response:       {reading.raw_value}")
+        print("=" * 60 + "\n")
+
+    def print_distance_readings(self, readings: Dict[str, Optional[DistanceSensorReading]]):
+        """Pretty print both distance sensor readings (left + right) side by side."""
+        print("\n" + "=" * 60)
+        print("DISTANCE SENSOR READINGS")
+        print("=" * 60)
+        for side, name in (("L", "Left "), ("R", "Right")):
+            pin = DISTANCE_PINS[side]
+            reading = readings.get(side)
+            if reading is None:
+                print(f"  {name} (pin {pin}):  no response")
+            else:
+                value = reading.value if reading.value is not None else "N/A"
+                print(f"  {name} (pin {pin}):  {value}")
+                if reading.raw_value:
+                    print(f"      raw: {reading.raw_value}")
+        print("=" * 60 + "\n")
+
     def print_imu_reading(self, reading: Optional[IMUSensorReading] = None):
         """Pretty print IMU sensor reading."""
         if reading is None:
@@ -919,8 +1090,11 @@ COMMAND SYNTAX:
   skill <name>              - Execute a predefined skill
   imu                       - Read IMU sensor (accelerometer/gyroscope)
   light [L|R]               - Read light sensor(s); no arg reads both (L=pin34, R=pin35)
+  distance [L|R]            - Read IR distance sensor(s); no arg reads both (L=pin34, R=pin35)
   light_on                  - Activate light sensor mode (XL)
   light_off                 - Deactivate light sensor mode (Xl)
+  distance_on               - Activate IR distance mode (XD)
+  distance_off              - Deactivate IR distance mode (Xd)
   gesture                   - Read one gesture value (auto-enables stream)
   gesture_on                - Enable gesture stream, dog stays still (XGPr)
   gesture_off               - Disable the gesture module (Xg)
@@ -947,6 +1121,10 @@ SENSOR EXAMPLES:
   light L                   - Read left light sensor  (GPIO 34)
   light R                   - Read right light sensor (GPIO 35)
   light 34                  - Read a pin number directly
+  distance                  - Read both IR distance sensors (left + right)
+  distance L                - Read left IR distance sensor  (GPIO 34)
+  distance R                - Read right IR distance sensor (GPIO 35)
+  distance_on               - Activate IR distance mode (XD) before reading
   gesture                   - Read one gesture (wave your hand while it waits)
   gesture_on                - Start continuous gesture stream, dog still (XGPr)
   gesture_off               - Stop the gesture module (Xg)
@@ -1032,11 +1210,27 @@ async def interactive_loop(controller: BittleBLEController):
                     # No side given -> read both light sensors.
                     await controller.read_light_sensors()
 
+            elif command == "distance":
+                arg = parts[1].upper() if len(parts) > 1 else None
+                if arg in ("L", "R"):
+                    reading = await controller.read_distance_sensor(side=arg)
+                    if reading:
+                        controller.print_distance_reading(reading)
+                else:
+                    # No side given -> read both distance sensors.
+                    await controller.read_distance_sensors()
+
             elif command == "light_on":
                 await controller.activate_light_mode()
 
             elif command == "light_off":
                 await controller.deactivate_light_mode()
+
+            elif command == "distance_on":
+                await controller.activate_distance_mode()
+
+            elif command == "distance_off":
+                await controller.deactivate_distance_mode()
 
             elif command == "gesture":
                 reading = await controller.read_gesture_sensor()
