@@ -5,7 +5,7 @@ async def find_bittle():
     """Scan for Bittle X device"""
     devices = await BleakScanner.discover()
     for device in devices:
-        if "Bittle" in device.name:
+        if device.name and "Bittle" in device.name:
             print(f"Found: {device.name} ({device.address})")
             return device.address
     return None

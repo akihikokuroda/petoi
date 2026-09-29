@@ -220,15 +220,13 @@ MOTOR_INDICES = {
     15: "Left ankle",
 }
 
-PIN_CHAR_MAP = {
-    '"': 34,
-    '#': 35,
-    '$': 36,
-    '%': 37,
-    '&': 38,
-    "'": 39,
-    'a': 97,
-    'd': 100,
+# Light sensor pin mapping.
+# The Bittle's two light sensors are wired to GPIO 34 (left) and GPIO 35 (right).
+# The 'light' command exposes them as 'L' and 'R'. Swap the two values here if
+# your physical wiring is reversed.
+LIGHT_PINS = {
+    "L": 34,  # left light sensor  -> GPIO 34
+    "R": 35,  # right light sensor -> GPIO 35
 }
 
 
@@ -475,31 +473,37 @@ class BittleBLEController:
         return await self.send_command("Xl")
 
     def resolve_light_command(self, cmd: str) -> str:
-        """Resolves a light command, allowing shorthand characters."""
+        """Resolve a light argument to the raw Bittle command to send.
+
+        Accepts:
+          - 'L' or 'R' (case-insensitive): the left / right light sensor
+            (see LIGHT_PINS -> GPIO 34 / 35).
+          - A pin number, e.g. '34' or '35'.
+          - A raw command already starting with 'Ra': passed through unchanged.
+
+        The Bittle firmware reads the GPIO whose number equals the ASCII code
+        of the single character after 'Ra', so we emit Ra<chr(pin)>:
+        pin 34 -> Ra"   pin 35 -> Ra#
+        """
         if cmd.startswith("Ra"):
             return cmd
 
-        # If it's a single character from the map, prepend 'Ra'
-        if len(cmd) == 1 and cmd in PIN_CHAR_MAP:
-            return f"Ra{cmd}"
+        key = cmd.upper()
+        if key in LIGHT_PINS:
+            return f"Ra{chr(LIGHT_PINS[key])}"
 
-        # If it's a number, convert to character and prepend 'Ra'
         if cmd.isdigit():
-            pin = int(cmd)
-            for char, p in PIN_CHAR_MAP.items():
-                if p == pin:
-                    return f"Ra{char}"
-            return f"Ra{cmd}"  # Fallback if pin not in map
+            return f"Ra{chr(int(cmd))}"
 
         return cmd
 
-    async def read_light_sensor(self, command: str = "Ra$", timeout: float = 2.0) -> Optional[LightSensorReading]:
+    async def read_light_sensor(self, command: str = 'Ra"', timeout: float = 2.0) -> Optional[LightSensorReading]:
         """
-        Read light sensor data from Bittle.
+        Read a single light sensor from the Bittle (default: left, GPIO 34).
         Sends command and waits for response (format: varies by command).
 
         Args:
-            command: Sensor command to send (default: "l")
+            command: Raw command to send (default: left sensor, 'Ra"')
             timeout: Response timeout in seconds (default: 2.0)
         """
         if not self.connected or not self.client or not self.char:
@@ -534,6 +538,23 @@ class BittleBLEController:
         except Exception as e:
             print(f"❌ Failed to read light sensor: {e}")
             return None
+
+    async def read_light_sensors(self, timeout: float = 2.0):
+        """Read both light sensors (left = GPIO 34, right = GPIO 35).
+
+        Reads them one after the other and prints both side by side.
+
+        Returns:
+            Dict {'L': LightSensorReading | None, 'R': LightSensorReading | None}
+        """
+        readings: Dict[str, Optional[LightSensorReading]] = {}
+        for side in ("L", "R"):
+            cmd = self.resolve_light_command(side)
+            readings[side] = await self.read_light_sensor(command=cmd, timeout=timeout)
+            # Small gap so the next command/response pair doesn't bleed into the queue.
+            await asyncio.sleep(0.3)
+        self.print_light_readings(readings)
+        return readings
 
     async def parse_light_sensor_response(self, response: str) -> Optional[LightSensorReading]:
         """
@@ -825,6 +846,23 @@ class BittleBLEController:
             print(f"  Raw Response:     {reading.raw_value}")
         print("=" * 60 + "\n")
 
+    def print_light_readings(self, readings: Dict[str, Optional[LightSensorReading]]):
+        """Pretty print both light sensor readings (left + right) side by side."""
+        print("\n" + "=" * 60)
+        print("LIGHT SENSOR READINGS")
+        print("=" * 60)
+        for side, name in (("L", "Left "), ("R", "Right")):
+            pin = LIGHT_PINS[side]
+            reading = readings.get(side)
+            if reading is None:
+                print(f"  {name} (pin {pin}):  no response")
+            else:
+                value = reading.brightness if reading.brightness is not None else "N/A"
+                print(f"  {name} (pin {pin}):  {value}")
+                if reading.raw_value:
+                    print(f"      raw: {reading.raw_value}")
+        print("=" * 60 + "\n")
+
     def print_imu_reading(self, reading: Optional[IMUSensorReading] = None):
         """Pretty print IMU sensor reading."""
         if reading is None:
@@ -880,7 +918,7 @@ COMMAND SYNTAX:
   motor <index> <angle>     - Control servo motor
   skill <name>              - Execute a predefined skill
   imu                       - Read IMU sensor (accelerometer/gyroscope)
-  light                     - Read light sensor
+  light [L|R]               - Read light sensor(s); no arg reads both (L=pin34, R=pin35)
   light_on                  - Activate light sensor mode (XL)
   light_off                 - Deactivate light sensor mode (Xl)
   gesture                   - Read one gesture value (auto-enables stream)
@@ -905,9 +943,10 @@ SKILL EXAMPLES:
 
 SENSOR EXAMPLES:
   imu                       - Read IMU (accel/gyro data)
-  light                     - Read light sensor (lux, RGB, color temp)
-  light R                   - Read sensor (R = read pin R)
-  light l                   - Try sensor command 'l'
+  light                     - Read both light sensors (left + right)
+  light L                   - Read left light sensor  (GPIO 34)
+  light R                   - Read right light sensor (GPIO 35)
+  light 34                  - Read a pin number directly
   gesture                   - Read one gesture (wave your hand while it waits)
   gesture_on                - Start continuous gesture stream, dog still (XGPr)
   gesture_off               - Stop the gesture module (Xg)
@@ -983,11 +1022,15 @@ async def interactive_loop(controller: BittleBLEController):
                     controller.print_imu_reading(reading)
 
             elif command == "light":
-                sensor_cmd = parts[1] if len(parts) > 1 else "Ra$"
-                sensor_cmd = controller.resolve_light_command(sensor_cmd)
-                reading = await controller.read_light_sensor(command=sensor_cmd)
-                if reading:
-                    controller.print_light_reading(reading)
+                arg = parts[1].upper() if len(parts) > 1 else None
+                if arg in ("L", "R"):
+                    sensor_cmd = controller.resolve_light_command(arg)
+                    reading = await controller.read_light_sensor(command=sensor_cmd)
+                    if reading:
+                        controller.print_light_reading(reading)
+                else:
+                    # No side given -> read both light sensors.
+                    await controller.read_light_sensors()
 
             elif command == "light_on":
                 await controller.activate_light_mode()
