@@ -78,6 +78,25 @@ class DistanceSensorReading:
 
 
 @dataclass
+class TouchSensorReading:
+    """Touch sensor (double touch) data.
+
+    value is the digital level of the touch pin: 0 = no touch, 1 = touched
+    (the pad outputs a high level whether touched lightly or pressed hard).
+    """
+    timestamp: datetime = field(default_factory=lambda: datetime.now())
+    value: Optional[int] = None
+    raw_value: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "value": self.value,
+            "raw_value": self.raw_value,
+        }
+
+
+@dataclass
 class IMUSensorReading:
     """IMU sensor data (accelerometer and gyroscope)."""
     timestamp: datetime = field(default_factory=lambda: datetime.now())
@@ -258,6 +277,14 @@ DISTANCE_PINS = {
     "R": 35,  # right IR distance sensor -> GPIO 35
 }
 
+# Touch sensor (double touch) pin mapping.
+# Two digital pads: left on GPIO 34 and right on GPIO 35. Read as a digital
+# value (Rd + pin) -> 0 (no touch) or 1 (touched). Mode toggled with 'XT' / 'Xt'.
+TOUCH_PINS = {
+    "L": 34,  # left  touch pad -> GPIO 34
+    "R": 35,  # right touch pad -> GPIO 35
+}
+
 
 class BittleBLEController:
     """Main controller for Petoi Bittle robot via Bluetooth LE."""
@@ -277,6 +304,7 @@ class BittleBLEController:
         self.connected = False
         self.last_light_reading: Optional[LightSensorReading] = None
         self.last_distance_reading: Optional[DistanceSensorReading] = None
+        self.last_touch_reading: Optional[TouchSensorReading] = None
         self.last_imu_reading: Optional[IMUSensorReading] = None
         self.last_gesture_reading: Optional[GestureSensorReading] = None
         self.gesture_mode_active: bool = False
@@ -512,6 +540,16 @@ class BittleBLEController:
         print("Deactivating IR distance mode...")
         return await self.send_command("Xd")
 
+    async def activate_touch_mode(self) -> bool:
+        """Activate the touch sensor mode (XT)."""
+        print("Activating touch mode...")
+        return await self.send_command("XT")
+
+    async def deactivate_touch_mode(self) -> bool:
+        """Deactivate the touch sensor mode (Xt)."""
+        print("Deactivating touch mode...")
+        return await self.send_command("Xt")
+
     def resolve_light_command(self, cmd: str) -> str:
         """Resolve a light argument to the raw Bittle command to send.
 
@@ -691,6 +729,103 @@ class BittleBLEController:
             return None
         except Exception as e:
             print(f"❌ Failed to parse distance response: {e}")
+            return None
+
+    def resolve_touch_command(self, side: str) -> str:
+        """Resolve a touch side ('L'/'R') to the raw Bittle digital read command.
+
+        The touch pads are read as digital values (Rd + pin), where the pin is
+        sent as the byte whose value equals the pin number (chr(pin)):
+        pin 34 -> Rd"   pin 35 -> Rd#
+        """
+        side = side.upper()
+        if side not in TOUCH_PINS:
+            return ""
+        return f"Rd{chr(TOUCH_PINS[side])}"
+
+    async def read_touch_sensor(self, side: str = "L", timeout: float = 2.0) -> Optional[TouchSensorReading]:
+        """
+        Read one touch pad (left or right).
+
+        Args:
+            side: 'L' or 'R' (see TOUCH_PINS for the pin).
+            timeout: Response timeout in seconds (default: 2.0).
+        """
+        command = self.resolve_touch_command(side)
+        if not command:
+            print(f"❌ Unknown touch side: '{side}' (expected 'L' or 'R')")
+            return None
+        if not self.connected or not self.client or not self.char:
+            print("❌ Not connected to Bittle")
+            return None
+
+        try:
+            print(f"Reading touch ({side}) with command: '{command}'")
+            await self.send_command(command)
+
+            # Add small delay to let fragments accumulate
+            await asyncio.sleep(0.3)
+
+            # Drain queue to get all accumulated responses
+            responses = []
+            while not self.sensor_response_queue.empty():
+                try:
+                    response = self.sensor_response_queue.get_nowait()
+                    responses.append(response)
+                except asyncio.QueueEmpty:
+                    break
+
+            if responses:
+                combined = "".join(responses)
+                print(f"Raw responses: {responses}")
+                print(f"Combined: {repr(combined)}")
+                return await self.parse_touch_response(combined)
+            else:
+                print(f"⚠ No response received for command '{command}'")
+                return None
+        except Exception as e:
+            print(f"❌ Failed to read touch: {e}")
+            return None
+
+    async def read_touch_sensors(self, timeout: float = 2.0):
+        """Read both touch pads (left + right) and print them side by side.
+
+        Returns:
+            Dict {'L': TouchSensorReading | None, 'R': TouchSensorReading | None}
+        """
+        readings: Dict[str, Optional[TouchSensorReading]] = {}
+        for side in ("L", "R"):
+            readings[side] = await self.read_touch_sensor(side=side, timeout=timeout)
+            # Small gap so the next command/response pair doesn't bleed into the queue.
+            await asyncio.sleep(0.3)
+        self.print_touch_readings(readings)
+        return readings
+
+    async def parse_touch_response(self, response: str) -> Optional[TouchSensorReading]:
+        """Parse a touch (digital) response.
+
+        Format: '=<value>' where value is 0 (no touch) or 1 (touched).
+        """
+        try:
+            response = response.strip()
+            if "=" in response:
+                value_str = response.split("=", 1)[1]
+                value_str = value_str.rstrip("=, \t\r\n").strip()
+                if re.fullmatch(r"\d+", value_str):
+                    reading = TouchSensorReading(
+                        value=int(value_str),
+                        raw_value=response,
+                    )
+                    self.last_touch_reading = reading
+                    state = "touched" if reading.value == 1 else "no touch"
+                    print(f"✓ Parsed touch: {state} (value={reading.value})")
+                    return reading
+                print(f"❌ Invalid touch value: {response}")
+                return None
+            print(f"❌ Unrecognized touch response: {response}")
+            return None
+        except Exception as e:
+            print(f"❌ Failed to parse touch response: {e}")
             return None
 
     async def parse_light_sensor_response(self, response: str) -> Optional[LightSensorReading]:
@@ -1034,6 +1169,47 @@ class BittleBLEController:
                     print(f"      raw: {reading.raw_value}")
         print("=" * 60 + "\n")
 
+    def print_touch_reading(self, reading: Optional[TouchSensorReading] = None):
+        """Pretty print a single touch sensor reading."""
+        if reading is None:
+            reading = self.last_touch_reading
+        if reading is None:
+            print("❌ No touch sensor reading available")
+            return
+
+        print("\n" + "=" * 60)
+        print("TOUCH SENSOR READING")
+        print("=" * 60)
+        print(f"  Timestamp:          {reading.timestamp.isoformat()}")
+        state = "touched" if reading.value == 1 else ("no touch" if reading.value == 0 else "N/A")
+        print(f"  State:              {state:>35}")
+        print(f"  Value (digital):    {reading.value if reading.value is not None else 'N/A':>35}")
+        if reading.raw_value:
+            print(f"  Raw Response:       {reading.raw_value}")
+        print("=" * 60 + "\n")
+
+    def print_touch_readings(self, readings: Dict[str, Optional[TouchSensorReading]]):
+        """Pretty print both touch sensor readings (left + right) side by side."""
+        print("\n" + "=" * 60)
+        print("TOUCH SENSOR READINGS")
+        print("=" * 60)
+        for side, name in (("L", "Left "), ("R", "Right")):
+            pin = TOUCH_PINS[side]
+            reading = readings.get(side)
+            if reading is None:
+                print(f"  {name} (pin {pin}):  no response")
+            else:
+                if reading.value == 1:
+                    state = "touched"
+                elif reading.value == 0:
+                    state = "no touch"
+                else:
+                    state = "N/A"
+                print(f"  {name} (pin {pin}):  {state}")
+                if reading.raw_value:
+                    print(f"      raw: {reading.raw_value}")
+        print("=" * 60 + "\n")
+
     def print_imu_reading(self, reading: Optional[IMUSensorReading] = None):
         """Pretty print IMU sensor reading."""
         if reading is None:
@@ -1091,10 +1267,13 @@ COMMAND SYNTAX:
   imu                       - Read IMU sensor (accelerometer/gyroscope)
   light [L|R]               - Read light sensor(s); no arg reads both (L=pin34, R=pin35)
   distance [L|R]            - Read IR distance sensor(s); no arg reads both (L=pin34, R=pin35)
+  touch [L|R]               - Read touch sensor(s); no arg reads both (L=pin34, R=pin35)
   light_on                  - Activate light sensor mode (XL)
   light_off                 - Deactivate light sensor mode (Xl)
   distance_on               - Activate IR distance mode (XD)
   distance_off              - Deactivate IR distance mode (Xd)
+  touch_on                  - Activate touch mode (XT)
+  touch_off                 - Deactivate touch mode (Xt)
   gesture                   - Read one gesture value (auto-enables stream)
   gesture_on                - Enable gesture stream, dog stays still (XGPr)
   gesture_off               - Disable the gesture module (Xg)
@@ -1125,6 +1304,10 @@ SENSOR EXAMPLES:
   distance L                - Read left IR distance sensor  (GPIO 34)
   distance R                - Read right IR distance sensor (GPIO 35)
   distance_on               - Activate IR distance mode (XD) before reading
+  touch                     - Read both touch pads (left + right)
+  touch L                   - Read left touch pad  (GPIO 34)
+  touch R                   - Read right touch pad (GPIO 35)
+  touch_on                  - Activate touch mode (XT) before reading
   gesture                   - Read one gesture (wave your hand while it waits)
   gesture_on                - Start continuous gesture stream, dog still (XGPr)
   gesture_off               - Stop the gesture module (Xg)
@@ -1220,6 +1403,16 @@ async def interactive_loop(controller: BittleBLEController):
                     # No side given -> read both distance sensors.
                     await controller.read_distance_sensors()
 
+            elif command == "touch":
+                arg = parts[1].upper() if len(parts) > 1 else None
+                if arg in ("L", "R"):
+                    reading = await controller.read_touch_sensor(side=arg)
+                    if reading:
+                        controller.print_touch_reading(reading)
+                else:
+                    # No side given -> read both touch pads.
+                    await controller.read_touch_sensors()
+
             elif command == "light_on":
                 await controller.activate_light_mode()
 
@@ -1231,6 +1424,12 @@ async def interactive_loop(controller: BittleBLEController):
 
             elif command == "distance_off":
                 await controller.deactivate_distance_mode()
+
+            elif command == "touch_on":
+                await controller.activate_touch_mode()
+
+            elif command == "touch_off":
+                await controller.deactivate_touch_mode()
 
             elif command == "gesture":
                 reading = await controller.read_gesture_sensor()
