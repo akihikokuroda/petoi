@@ -97,6 +97,43 @@ class TouchSensorReading:
 
 
 @dataclass
+class BackTouchSensorReading:
+    """Back touch sensor data (single multiplexed analog sensor, 4 pads).
+
+    The four pads (Front Left, Front Right, Center, Back) share one analog
+    channel (pin 38). The raw value is an ADC count; dividing it by 600
+    selects the band and maps to a pad:
+
+        value            -> touch_id -> location
+        0                -> 1        -> Front Left
+        600..1199        -> 3        -> Center
+        1200..1799       -> 4        -> Back
+        1800..2399       -> 2        -> Front Right
+        2400 or higher   -> 0        -> No touch
+        (0 < value < 600) is flagged as a possible bad connection.
+
+    touch_id uses the reference convention:
+        0 = No touch, 1 = Front Left, 2 = Front Right, 3 = Center, 4 = Back.
+    """
+    timestamp: datetime = field(default_factory=lambda: datetime.now())
+    value: Optional[int] = None        # raw analog (ADC) value read from pin 38
+    raw_value: Optional[str] = None    # raw serial response string
+    touch_id: int = 0                  # 0=none,1=FL,2=FR,3=Center,4=Back
+    location: str = "No touch"         # decoded human-readable pad name
+    ok: bool = True                    # False if the value looks like a wiring error
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "value": self.value,
+            "raw_value": self.raw_value,
+            "touch_id": self.touch_id,
+            "location": self.location,
+            "ok": self.ok,
+        }
+
+
+@dataclass
 class IMUSensorReading:
     """IMU sensor data (accelerometer and gyroscope)."""
     timestamp: datetime = field(default_factory=lambda: datetime.now())
@@ -285,6 +322,16 @@ TOUCH_PINS = {
     "R": 35,  # right touch pad -> GPIO 35
 }
 
+# Back touch sensor (4 pads: Front Left, Front Right, Center, Back).
+# Unlike the double-touch module, all four pads are multiplexed onto a SINGLE
+# analog channel (GPIO 38). Reading the raw value and dividing by 600 selects
+# the band that maps to a pad. Mode is toggled with 'XB' (on) / 'Xb' (off).
+BACK_TOUCH_PIN = 38
+# index (raw_value // 600) -> touch_id, matching the reference robot.py mapping.
+BACK_TOUCH_PAD_MAP = [1, 3, 4, 2]
+# touch_id -> human-readable location name (index = touch_id - 1).
+BACK_TOUCH_LOCATIONS = ["Front Left", "Front Right", "Center", "Back"]
+
 
 class BittleBLEController:
     """Main controller for Petoi Bittle robot via Bluetooth LE."""
@@ -305,6 +352,7 @@ class BittleBLEController:
         self.last_light_reading: Optional[LightSensorReading] = None
         self.last_distance_reading: Optional[DistanceSensorReading] = None
         self.last_touch_reading: Optional[TouchSensorReading] = None
+        self.last_back_touch_reading: Optional[BackTouchSensorReading] = None
         self.last_imu_reading: Optional[IMUSensorReading] = None
         self.last_gesture_reading: Optional[GestureSensorReading] = None
         self.gesture_mode_active: bool = False
@@ -549,6 +597,16 @@ class BittleBLEController:
         """Deactivate the touch sensor mode (Xt)."""
         print("Deactivating touch mode...")
         return await self.send_command("Xt")
+
+    async def activate_back_touch_mode(self) -> bool:
+        """Activate the back touch sensor mode (XB)."""
+        print("Activating back touch mode...")
+        return await self.send_command("XB")
+
+    async def deactivate_back_touch_mode(self) -> bool:
+        """Deactivate the back touch sensor mode (Xb)."""
+        print("Deactivating back touch mode...")
+        return await self.send_command("Xb")
 
     def resolve_light_command(self, cmd: str) -> str:
         """Resolve a light argument to the raw Bittle command to send.
@@ -826,6 +884,98 @@ class BittleBLEController:
             return None
         except Exception as e:
             print(f"❌ Failed to parse touch response: {e}")
+            return None
+
+    def resolve_back_touch_command(self) -> str:
+        """Return the raw Bittle command to read the back touch sensor.
+
+        The back touch module is a single analog sensor on pin 38, so this is
+        just an analog read: 'Ra' + chr(38) -> 'Ra&'.
+        """
+        return f"Ra{chr(BACK_TOUCH_PIN)}"
+
+    async def read_back_touch_sensor(self, timeout: float = 2.0) -> Optional[BackTouchSensorReading]:
+        """
+        Read the back touch sensor (Front Left / Front Right / Center / Back).
+
+        Reads one analog value from pin 38 and decodes it into a touch
+        location. Returns a BackTouchSensorReading, or None if no response.
+        """
+        command = self.resolve_back_touch_command()
+        if not self.connected or not self.client or not self.char:
+            print("❌ Not connected to Bittle")
+            return None
+
+        try:
+            print(f"Reading back touch with command: '{command}'")
+            await self.send_command(command)
+
+            # Add small delay to let fragments accumulate
+            await asyncio.sleep(0.3)
+
+            # Drain queue to get all accumulated responses
+            responses = []
+            while not self.sensor_response_queue.empty():
+                try:
+                    response = self.sensor_response_queue.get_nowait()
+                    responses.append(response)
+                except asyncio.QueueEmpty:
+                    break
+
+            if responses:
+                combined = "".join(responses)
+                print(f"Raw responses: {responses}")
+                print(f"Combined: {repr(combined)}")
+                return await self.parse_back_touch_response(combined)
+            else:
+                print(f"⚠ No response received for command '{command}'")
+                return None
+        except Exception as e:
+            print(f"❌ Failed to read back touch: {e}")
+            return None
+
+    async def parse_back_touch_response(self, response: str) -> Optional[BackTouchSensorReading]:
+        """Parse a back touch response and decode the touched location.
+
+        Format: '=<value>' where value is the raw analog (ADC) reading.
+        The raw value is divided by 600 to pick a band, which maps to one of
+        the four pads via BACK_TOUCH_PAD_MAP (see BackTouchSensorReading).
+        """
+        try:
+            response = response.strip()
+            if "=" in response:
+                value_str = response.split("=", 1)[1]
+                value_str = value_str.rstrip("=, \t\r\n").strip()
+                if not re.fullmatch(r"\d+", value_str):
+                    print(f"❌ Invalid back touch value: {response}")
+                    return None
+
+                raw = int(value_str)
+                reading = BackTouchSensorReading(value=raw, raw_value=response)
+
+                # Decode the raw analog value into a touch location, matching
+                # the reference robot.py readBackTouchSensorVal() logic.
+                if raw > 0 and raw < 600:
+                    reading.ok = False
+                    reading.touch_id = -1
+                    reading.location = "No touch (check sensor connection)"
+                elif raw < 2400:
+                    index = min(int(raw // 600), len(BACK_TOUCH_PAD_MAP) - 1)
+                    reading.touch_id = BACK_TOUCH_PAD_MAP[index]
+                    reading.location = BACK_TOUCH_LOCATIONS[reading.touch_id - 1]
+                else:
+                    reading.touch_id = 0
+                    reading.location = "No touch"
+
+                self.last_back_touch_reading = reading
+                print(f"✓ Parsed back touch: {reading.location} "
+                      f"(value={reading.value}, id={reading.touch_id})")
+                return reading
+
+            print(f"❌ Unrecognized back touch response: {response}")
+            return None
+        except Exception as e:
+            print(f"❌ Failed to parse back touch response: {e}")
             return None
 
     async def parse_light_sensor_response(self, response: str) -> Optional[LightSensorReading]:
@@ -1210,6 +1360,28 @@ class BittleBLEController:
                     print(f"      raw: {reading.raw_value}")
         print("=" * 60 + "\n")
 
+    def print_back_touch_reading(self, reading: Optional[BackTouchSensorReading] = None):
+        """Pretty print one back touch sensor reading."""
+        if reading is None:
+            reading = self.last_back_touch_reading
+        if reading is None:
+            print("❌ No back touch sensor reading available")
+            return
+
+        print("\n" + "=" * 60)
+        print("BACK TOUCH SENSOR READING")
+        print("=" * 60)
+        print(f"  Timestamp:          {reading.timestamp.isoformat()}")
+        print(f"  Location:           {reading.location:>35}")
+        print(f"  Touch ID:           {reading.touch_id:>35}")
+        value = reading.value if reading.value is not None else "N/A"
+        print(f"  Raw Value (analog): {value:>35}")
+        if not reading.ok:
+            print("  ⚠ Value looks like a bad connection (0 < value < 600).")
+        if reading.raw_value:
+            print(f"  Raw Response:       {reading.raw_value}")
+        print("=" * 60 + "\n")
+
     def print_imu_reading(self, reading: Optional[IMUSensorReading] = None):
         """Pretty print IMU sensor reading."""
         if reading is None:
@@ -1268,12 +1440,15 @@ COMMAND SYNTAX:
   light [L|R]               - Read light sensor(s); no arg reads both (L=pin34, R=pin35)
   distance [L|R]            - Read IR distance sensor(s); no arg reads both (L=pin34, R=pin35)
   touch [L|R]               - Read touch sensor(s); no arg reads both (L=pin34, R=pin35)
+  backtouch                 - Read the back touch sensor (Front Left/Front Right/Center/Back, pin38)
   light_on                  - Activate light sensor mode (XL)
   light_off                 - Deactivate light sensor mode (Xl)
   distance_on               - Activate IR distance mode (XD)
   distance_off              - Deactivate IR distance mode (Xd)
   touch_on                  - Activate touch mode (XT)
   touch_off                 - Deactivate touch mode (Xt)
+  backtouch_on              - Activate back touch mode (XB)
+  backtouch_off             - Deactivate back touch mode (Xb)
   gesture                   - Read one gesture value (auto-enables stream)
   gesture_on                - Enable gesture stream, dog stays still (XGPr)
   gesture_off               - Disable the gesture module (Xg)
@@ -1308,6 +1483,8 @@ SENSOR EXAMPLES:
   touch L                   - Read left touch pad  (GPIO 34)
   touch R                   - Read right touch pad (GPIO 35)
   touch_on                  - Activate touch mode (XT) before reading
+  backtouch                 - Read the back touch sensor -> Front Left/Front Right/Center/Back
+  backtouch_on              - Activate back touch mode (XB) before reading
   gesture                   - Read one gesture (wave your hand while it waits)
   gesture_on                - Start continuous gesture stream, dog still (XGPr)
   gesture_off               - Stop the gesture module (Xg)
@@ -1413,6 +1590,11 @@ async def interactive_loop(controller: BittleBLEController):
                     # No side given -> read both touch pads.
                     await controller.read_touch_sensors()
 
+            elif command == "backtouch":
+                reading = await controller.read_back_touch_sensor()
+                if reading:
+                    controller.print_back_touch_reading(reading)
+
             elif command == "light_on":
                 await controller.activate_light_mode()
 
@@ -1430,6 +1612,12 @@ async def interactive_loop(controller: BittleBLEController):
 
             elif command == "touch_off":
                 await controller.deactivate_touch_mode()
+
+            elif command == "backtouch_on":
+                await controller.activate_back_touch_mode()
+
+            elif command == "backtouch_off":
+                await controller.deactivate_back_touch_mode()
 
             elif command == "gesture":
                 reading = await controller.read_gesture_sensor()
