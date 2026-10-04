@@ -505,7 +505,7 @@ class LLMBittleController:
     async def read_light(self, side: str = "both") -> ToolResult:
         """Read the light sensor(s). side: 'L', 'R', or 'both'."""
         try:
-            await self.bittle.activate_light_mode()
+            # await self.bittle.activate_light_mode()
             if side and side.upper() in ("L", "R"):
                 reading = await self.bittle.read_light_sensor(
                     command=self.bittle.resolve_light_command(side.upper())
