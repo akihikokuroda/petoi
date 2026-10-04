@@ -43,8 +43,8 @@ class LLMBittleController:
     def __init__(self, bittle_address: Optional[str] = None, debug: Optional[bool] = None):
         self.bittle = BittleBLEController(address=bittle_address, command_delay=0.05)
         self.ollama_url = "http://localhost:11434/api/chat"
-        # self.model = "granite4.2:3b"
-        self.model = "qwen3.8:27b"
+        self.model = "granite4.2:3b"
+        # self.model = "qwen3.8:27b"
         self.conversation_history = []
         if debug is None:
             debug = os.environ.get("BITTLE_DEBUG", "").strip().lower() in (
