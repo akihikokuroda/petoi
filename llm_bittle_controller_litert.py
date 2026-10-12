@@ -44,6 +44,13 @@ class ToolResult:
 class LLMBittleController:
     """Bridge between a LiteRT-LM LLM and the Petoi Bittle robot"""
 
+    # The LiteRT-LM models (~3B) have a ~4096-token context window shared by the
+    # system prompt, all tool schemas, and the conversation history. Both limits
+    # below keep the per-request payload inside that window; tune down if the
+    # "Input token ids are too long" error still appears with more tools.
+    MAX_HISTORY_MESSAGES = 20
+    MAX_TOOL_RESULT_CHARS = 500
+
     def __init__(self, bittle_address: Optional[str] = None, debug: Optional[bool] = None):
         self.bittle = BittleBLEController(address=bittle_address, command_delay=0.05)
         # LiteRT-LM `litert-lm serve` defaults to 0.0.0.0:9379
@@ -916,6 +923,21 @@ express those concepts.
 - Respect the robot's physical limitations
 - Always provide feedback on what the robot is doing"""
 
+    def _trim_history(self) -> None:
+        """Keep the conversation history bounded so requests stay under the
+        model's context window.
+
+        Only the most recent messages are kept, and any leading ``tool`` results
+        whose assistant ``tool_calls`` anchor was trimmed off are dropped —
+        a tool result with no preceding tool call is an invalid message that the
+        server would reject.
+        """
+        msgs = self.conversation_history
+        if len(msgs) > self.MAX_HISTORY_MESSAGES:
+            msgs[:] = msgs[-self.MAX_HISTORY_MESSAGES:]
+        while msgs and msgs[0].get("role") == "tool":
+            msgs.pop(0)
+
     async def chat(self, user_message: str) -> str:
         """Send a message and get a response from LiteRT-LM, dispatching any tool calls.
 
@@ -929,6 +951,7 @@ express those concepts.
         max_rounds = 10
         content = ""
         for _ in range(max_rounds):
+            self._trim_history()
             payload = {
                 "model": self.model,
                 "messages": [
@@ -993,6 +1016,17 @@ express those concepts.
                 logger.debug("dispatching tool call: %s args=%s", tool_name, args)
                 tool_result = await self.process_tool_call(tool_name, args)
                 logger.debug("tool %s -> %s", tool_name, tool_result)
+                if len(tool_result) > self.MAX_TOOL_RESULT_CHARS:
+                    logger.debug(
+                        "truncating tool %s result from %d to %d chars",
+                        tool_name,
+                        len(tool_result),
+                        self.MAX_TOOL_RESULT_CHARS,
+                    )
+                    tool_result = (
+                        tool_result[: self.MAX_TOOL_RESULT_CHARS]
+                        + "...[truncated]"
+                    )
                 self.conversation_history.append(
                     {
                         "role": "tool",
