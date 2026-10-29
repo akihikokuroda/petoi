@@ -194,6 +194,52 @@ GESTURE_VALUE_NAMES = {
 # received over BLE — see activate_gesture_mode().
 GESTURE_MODE_FLAG_INDEX = 8
 
+# Index of the Camera flag in the module-status list (moduleList in
+# src/OpenCat.h: ..., Gesture, Camera, Quick_Demo).
+# NOTE: same as gesture — printed USB-only, never received over BLE.
+CAMERA_MODE_FLAG_INDEX = 9
+
+
+@dataclass
+class VisionSensorReading:
+    """Vision AI (Grove Vision AI V2) camera detection data.
+
+    x, y: target position in the 240x240 camera frame (0-240); pushed
+    lines are centered (value - 120), so they range roughly -120..120.
+    size: width of the detected target box (larger = closer/bigger).
+    """
+    timestamp: datetime = field(default_factory=lambda: datetime.now())
+    x: Optional[int] = None
+    y: Optional[int] = None
+    size: Optional[int] = None
+    height: Optional[int] = None
+    position: Optional[str] = None
+    raw_value: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "x": self.x,
+            "y": self.y,
+            "size": self.size,
+            "height": self.height,
+            "position": self.position,
+            "raw_value": self.raw_value,
+        }
+
+
+# Grove Vision AI V2 frame size in pixels (imgRangeX/imgRangeY in
+# src/camera.h: "the frame size 0~240 on X and Y direction").
+VISION_FRAME_RANGE = 240
+
+# Vision AI result line as pushed by showRecognitionResult() in
+# src/camera.h: "<x><tab><y><tab>size = <width><tab><height>?"
+# The one-shot "XCp" reply is the same line prefixed with "=".
+VISION_RESULT_RE = re.compile(
+    r"^\s*=?\s*(-?\d+(?:\.\d+)?)\s*[\t ]\s*(-?\d+(?:\.\d+)?)\s*[\t ]\s*"
+    r"size = (-?\d+(?:\.\d+)?)\s*(?:[\t ]\s*(-?\d+(?:\.\d+)?))?\s*$"
+)
+
 
 # Common skills for Bittle
 SKILLS = {
@@ -356,6 +402,8 @@ class BittleBLEController:
         self.last_imu_reading: Optional[IMUSensorReading] = None
         self.last_gesture_reading: Optional[GestureSensorReading] = None
         self.gesture_mode_active: bool = False
+        self.last_vision_reading: Optional[VisionSensorReading] = None
+        self.vision_mode_active: bool = False
         self.sensor_response_queue: asyncio.Queue = asyncio.Queue()
         self.imu_response_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
         self.notify_char = None
@@ -1246,6 +1294,184 @@ class BittleBLEController:
         """Get the last recorded gesture sensor reading."""
         return self.last_gesture_reading
 
+    async def activate_vision_mode(self, reactions: bool = False) -> bool:
+        """Enable the Vision AI (Grove Vision AI V2) camera module.
+
+        Firmware behavior (src/reaction.h, src/camera.h):
+          - "X" + uppercase letter enables that module (and disables the
+            other non-protected modules).
+          - option "P" -> continuous print: every new detection (changed
+            x/y) is pushed to the client as "x\ty\tsize = w[\th]".
+          - option "r" -> turn the automatic reactions (head tracking,
+            walk towards/away from the target) OFF; "R" -> leave them ON.
+
+        So "XCPr" (default) = module on + detection stream + robot stays
+        still, which is what you want for reading. "XCR" = same but the
+        dog tracks the target with its head as well.
+
+        Note: the continuous stream only pushes when the detected
+        coordinates change — keep moving in front of the camera to see
+        updates, the same way a gesture has to change to be streamed.
+        """
+        if not self.connected or not self.client or not self.char:
+            print("❌ Not connected to Bittle")
+            return False
+
+        cmd = "XCR" if reactions else "XCPr"
+        note = "reactions ON (dog will track the target with its head)" if reactions \
+            else "reactions OFF (dog stays still)"
+        print(f"Activating vision mode ({cmd}) — continuous detection stream, {note}")
+        if not await self.send_command(cmd):
+            return False
+
+        self.vision_mode_active = True
+        print("✓ Vision mode active — show a face/animal/object in front of the camera")
+        return True
+
+    async def deactivate_vision_mode(self) -> bool:
+        """Disable the Vision AI camera module (Xc) and stop the stream."""
+        if not self.connected or not self.client or not self.char:
+            print("❌ Not connected to Bittle")
+            return False
+
+        print("Deactivating vision mode (Xc)...")
+        if not await self.send_command("Xc"):
+            return False
+
+        self.vision_mode_active = False
+        print("✓ Vision mode deactivated")
+        return True
+
+    def _vision_flag_active(self, response: str) -> bool:
+        """Check the Camera flag (index 9) in a module-status list response.
+
+        Only useful over USB serial — the list is not sent over BLE.
+        """
+        pattern = re.compile(r'^(?=.*[01])(?=.*,).+$', flags=re.MULTILINE)
+        for line in pattern.findall(response):
+            line = line.replace('\t', '').replace('\r', '').replace('\n', '').strip()
+            try:
+                flags = [int(x) for x in line.split(',')[:-1]]
+            except ValueError:
+                continue
+            if len(flags) > CAMERA_MODE_FLAG_INDEX and flags[CAMERA_MODE_FLAG_INDEX] == 1:
+                return True
+        return False
+
+    def _is_vision_result(self, message: str) -> bool:
+        """True if this BLE message is a pushed camera result line.
+
+        Format (showRecognitionResult in src/camera.h):
+          x<tab>y<tab>size = width<tab>height?
+        The one-shot "XCp" reply is the same line prefixed with "=".
+        """
+        return VISION_RESULT_RE.match(message) is not None
+
+    @staticmethod
+    def _vision_position_label(x: int, y: int) -> str:
+        """Describe a 240x240-frame coordinate as a human position label.
+
+        x: -120 (left) .. 0 (center) .. +120 (right)
+        y: -120 (lower) .. 0 (center) .. +120 (upper)
+        """
+        third = VISION_FRAME_RANGE // 6  # 40
+        horizontal = "center" if abs(x) < third else ("left" if x < 0 else "right")
+        vertical = "center" if abs(y) < third else ("lower" if y < 0 else "upper")
+        if horizontal == "center" and vertical == "center":
+            return "center"
+        if horizontal == "center":
+            return vertical
+        if vertical == "center":
+            return horizontal
+        return f"{vertical} {horizontal}"
+
+    async def read_vision_sensor(self, timeout: float = 10.0) -> Optional[VisionSensorReading]:
+        """
+        Read one camera detection from the Bittle (Grove Vision AI V2).
+
+        Result meaning (showRecognitionResult in src/camera.h):
+          x, y = target position in the 240x240 frame (centered: -120..120)
+          size = width of the target box (larger = closer/bigger)
+
+        While the camera module runs in continuous print mode (XCPr), the
+        firmware pushes a result line every time the detected coordinates
+        change, so this method enables the stream if needed, then waits up
+        to `timeout` seconds for a pushed line, skipping unrelated traffic
+        on the BLE channel.
+
+        Move in front of the camera (a face, an animal, or a clear
+        object) while it is waiting — a completely still target is only
+        pushed once, when it first appears.
+
+        Args:
+            timeout: How long to wait for a detection, in seconds
+        """
+        if not self.connected or not self.client or not self.char:
+            print("❌ Not connected to Bittle")
+            return None
+
+        if not self.vision_mode_active:
+            if not await self.activate_vision_mode():
+                return None
+
+        # Drop stale messages left over from earlier commands
+        while not self.sensor_response_queue.empty():
+            try:
+                self.sensor_response_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        print(f"Waiting for a camera detection — move in front of the camera... ({timeout:.0f}s)")
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                print("⚠ No detection received in time")
+                print("  Keep a face/animal/object steadily in front of the camera")
+                return None
+            try:
+                message = await asyncio.wait_for(
+                    self.sensor_response_queue.get(), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                print("⚠ No detection received in time")
+                return None
+            if self._is_vision_result(message):
+                return self.parse_vision_response(message)
+            # anything else (reaction echoes, status text, ...) is ignored
+
+    def parse_vision_response(self, response: str) -> Optional[VisionSensorReading]:
+        """Parse a camera result line from the Bittle.
+
+        Accepts the streamed line ("x\\ty\\tsize = w[\\th]") as well as the
+        one-shot "XCp" reply ("=x\\ty\\tsize = w[\\th]").
+        """
+        try:
+            match = VISION_RESULT_RE.match(response.strip())
+            if not match:
+                print(f"❌ No vision result in response: {response!r}")
+                return None
+            x = int(float(match.group(1)))
+            y = int(float(match.group(2)))
+            size = int(float(match.group(3)))
+            height = int(float(match.group(4))) if match.group(4) is not None else None
+            position = self._vision_position_label(x, y)
+            reading = VisionSensorReading(
+                x=x, y=y, size=size, height=height,
+                position=position, raw_value=response,
+            )
+            self.last_vision_reading = reading
+            print(f"✓ Vision target at x={x}, y={y}, size={size} — {position}")
+            return reading
+        except (ValueError, re.error) as e:
+            print(f"❌ Failed to parse vision response: {e}")
+            return None
+
+    def get_last_vision_reading(self) -> Optional[VisionSensorReading]:
+        """Get the last recorded vision sensor reading."""
+        return self.last_vision_reading
+
     def print_light_reading(self, reading: Optional[LightSensorReading] = None):
         """Pretty print light sensor reading."""
         if reading is None:
@@ -1425,6 +1651,28 @@ class BittleBLEController:
         print("  Legend:     -1=none  0=up  1=down  2=left  3=right")
         print("=" * 60 + "\n")
 
+    def print_vision_reading(self, reading: Optional[VisionSensorReading] = None):
+        """Pretty print vision sensor (Grove Vision AI V2) reading."""
+        if reading is None:
+            reading = self.last_vision_reading
+        if reading is None:
+            print("❌ No vision sensor reading available")
+            return
+
+        print("\n" + "=" * 60)
+        print("VISION SENSOR READING (Grove Vision AI V2)")
+        print("=" * 60)
+        print(f"  Timestamp:  {reading.timestamp.isoformat()}")
+        print(f"  X position: {reading.x if reading.x is not None else 'N/A'}   (frame 0..{VISION_FRAME_RANGE}, pushed centered)")
+        print(f"  Y position: {reading.y if reading.y is not None else 'N/A'}   (frame 0..{VISION_FRAME_RANGE}, pushed centered)")
+        print(f"  Size (w):   {reading.size if reading.size is not None else 'N/A'}   (target box width; larger = closer/bigger)")
+        if reading.height is not None:
+            print(f"  Height (h): {reading.height}")
+        print(f"  Position:   {reading.position if reading.position is not None else 'N/A'}")
+        if reading.raw_value:
+            print(f"  Raw:        {reading.raw_value}")
+        print("=" * 60 + "\n")
+
 
 def show_help():
     """Display help information."""
@@ -1453,6 +1701,10 @@ COMMAND SYNTAX:
   gesture_on                - Enable gesture stream, dog stays still (XGPr)
   gesture_off               - Disable the gesture module (Xg)
   gesture_react             - Stream + let the dog react (XGPR)
+  vision                    - Read one camera detection (auto-enables stream)
+  vision_on                 - Enable Vision AI stream, dog stays still (XCPr)
+  vision_off                - Disable the Vision AI camera (Xc)
+  vision_react              - Stream + let the dog track the target (XCR)
   help                      - Show this help
   motors                    - List all motors
   skills                    - List all skills
@@ -1490,6 +1742,11 @@ SENSOR EXAMPLES:
   gesture_off               - Stop the gesture module (Xg)
   gesture_react             - Stream + let the dog react (XGPR)
   gesture values:           -1=none 0=up 1=down 2=left 3=right
+  vision                    - Read one detection from the Grove Vision AI V2 camera
+  vision_on                 - Start continuous detection stream, dog still (XCPr)
+  vision_off                - Stop the Vision AI camera (Xc)
+  vision_react              - Stream + let the dog track the target (XCR)
+  vision values:            x/y target position (0-240 frame), size = box width
 
 DIRECT COMMANDS:
   Send raw Petoi commands directly:
@@ -1632,6 +1889,20 @@ async def interactive_loop(controller: BittleBLEController):
 
             elif command == "gesture_react":
                 await controller.activate_gesture_mode(reactions=True)
+
+            elif command == "vision":
+                reading = await controller.read_vision_sensor()
+                if reading:
+                    controller.print_vision_reading(reading)
+
+            elif command == "vision_on":
+                await controller.activate_vision_mode()
+
+            elif command == "vision_off":
+                await controller.deactivate_vision_mode()
+
+            elif command == "vision_react":
+                await controller.activate_vision_mode(reactions=True)
 
             elif command == "motor":
                 if len(parts) < 3:

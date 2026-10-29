@@ -284,6 +284,22 @@ class LLMBittleController:
                 },
             },
             {
+                "name": "bittle_read_vision",
+                "description": "Wait for and read one camera detection from the Vision AI (Grove Vision AI V2). Returns the target's position (x, y in the 240x240 frame, centered so -120..120), its size, and a position label. Ask the user to put a face, an animal, or a clear object in front of the camera while this runs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "timeout": {
+                            "type": "number",
+                            "description": "How long to wait for a detection, in seconds (default: 10)",
+                            "default": 10,
+                            "minimum": 1,
+                            "maximum": 30,
+                        }
+                    },
+                },
+            },
+            {
                 "name": "bittle_activate_light",
                 "description": "Activate the light sensor mode (enables the light module on the shared sensor pins).",
                 "parameters": {
@@ -330,6 +346,20 @@ class LLMBittleController:
                 },
             },
             {
+                "name": "bittle_activate_vision",
+                "description": "Activate the Vision AI camera and start the continuous detection stream. Optionally let the dog track the target with its head (reactions).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reactions": {
+                            "type": "boolean",
+                            "description": "Whether the robot should track the target with its head (default: false, stays still)",
+                            "default": False,
+                        }
+                    },
+                },
+            },
+            {
                 "name": "bittle_deactivate_light",
                 "description": "Deactivate the light sensor mode (turns the light module off on the shared sensor pins).",
                 "parameters": {
@@ -364,6 +394,14 @@ class LLMBittleController:
             {
                 "name": "bittle_deactivate_gesture",
                 "description": "Deactivate the gesture sensor and stop the continuous value stream.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+            {
+                "name": "bittle_deactivate_vision",
+                "description": "Deactivate the Vision AI camera and stop the continuous detection stream.",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -615,6 +653,23 @@ class LLMBittleController:
         except Exception as e:
             return ToolResult(success=False, message=f"Failed to read gesture: {e}")
 
+    async def read_vision(self, timeout: float = 10.0) -> ToolResult:
+        """Wait for and read one camera detection from the Vision AI camera."""
+        try:
+            reading = await self.bittle.read_vision_sensor(timeout=timeout)
+            if reading is None:
+                return ToolResult(
+                    success=False,
+                    message="No detection received in time — ask the user to put a face, an animal, or a clear object steadily in front of the camera",
+                )
+            return ToolResult(
+                success=True,
+                message=f"Vision target at x={reading.x}, y={reading.y}, size={reading.size} — {reading.position}",
+                data=reading.to_dict(),
+            )
+        except Exception as e:
+            return ToolResult(success=False, message=f"Failed to read vision sensor: {e}")
+
     async def activate_light(self) -> ToolResult:
         """Activate the light sensor mode."""
         try:
@@ -684,6 +739,20 @@ class LLMBittleController:
         except Exception as e:
             return ToolResult(success=False, message=f"Failed to activate gesture sensor: {e}")
 
+    async def activate_vision(self, reactions: bool = False) -> ToolResult:
+        """Activate the Vision AI camera and start the detection stream."""
+        try:
+            success = await self.bittle.activate_vision_mode(reactions=reactions)
+            if success:
+                message = "Vision camera activated"
+                if reactions:
+                    message += " — the dog will track the target with its head"
+            else:
+                message = "Failed to activate vision camera"
+            return ToolResult(success=success, message=message)
+        except Exception as e:
+            return ToolResult(success=False, message=f"Failed to activate vision camera: {e}")
+
     async def deactivate_light(self) -> ToolResult:
         """Deactivate the light sensor mode."""
         try:
@@ -749,6 +818,19 @@ class LLMBittleController:
         except Exception as e:
             return ToolResult(success=False, message=f"Failed to deactivate gesture sensor: {e}")
 
+    async def deactivate_vision(self) -> ToolResult:
+        """Deactivate the Vision AI camera and stop the detection stream."""
+        try:
+            success = await self.bittle.deactivate_vision_mode()
+            return ToolResult(
+                success=success,
+                message="Vision camera deactivated"
+                if success
+                else "Failed to deactivate vision camera",
+            )
+        except Exception as e:
+            return ToolResult(success=False, message=f"Failed to deactivate vision camera: {e}")
+
     async def process_tool_call(self, tool_name: str, tool_input: dict) -> str:
         """Process a tool call from Claude"""
         logger.debug("tool call: %s args=%s", tool_name, tool_input)
@@ -789,6 +871,8 @@ class LLMBittleController:
             result = await self.read_imu()
         elif tool_name == "bittle_read_gesture":
             result = await self.read_gesture(tool_input.get("timeout", 5.0))
+        elif tool_name == "bittle_read_vision":
+            result = await self.read_vision(tool_input.get("timeout", 10.0))
         elif tool_name == "bittle_activate_light":
             result = await self.activate_light()
         elif tool_name == "bittle_activate_distance":
@@ -799,6 +883,8 @@ class LLMBittleController:
             result = await self.activate_back_touch()
         elif tool_name == "bittle_activate_gesture":
             result = await self.activate_gesture(tool_input.get("reactions", False))
+        elif tool_name == "bittle_activate_vision":
+            result = await self.activate_vision(tool_input.get("reactions", False))
         elif tool_name == "bittle_deactivate_light":
             result = await self.deactivate_light()
         elif tool_name == "bittle_deactivate_distance":
@@ -809,6 +895,8 @@ class LLMBittleController:
             result = await self.deactivate_back_touch()
         elif tool_name == "bittle_deactivate_gesture":
             result = await self.deactivate_gesture()
+        elif tool_name == "bittle_deactivate_vision":
+            result = await self.deactivate_vision()
         else:
             result = ToolResult(success=False, message=f"Unknown tool: {tool_name}")
             logger.debug("unknown tool requested: %s", tool_name)
@@ -837,7 +925,7 @@ You can control the Bittle robot through the following tools:
 4. Query robot status and battery level
 5. Make the robot beep for feedback
 6. Calibrate motors to neutral positions
-7. Read sensors to perceive the environment (light, distance, touch, IMU, gestures)
+7. Read sensors to perceive the environment (light, distance, touch, IMU, gestures, vision)
 
 ## Sensors
 
@@ -849,6 +937,11 @@ Use the sensor tools to react to the world around the robot:
 - bittle_read_imu — accelerometer + gyroscope, useful for checking balance and orientation
 - bittle_read_gesture — a hand gesture (up / down / left / right); ask the user to wave a hand
   near the robot while it runs
+- bittle_read_vision — one detection from the Vision AI camera: target position (x, y in the
+  240x240 frame, centered -120..120), size, and a position label (e.g. "upper left", "center");
+  ask the user to put a face, an animal, or a clear object in front of the camera while it runs.
+  A larger size means the target is closer. You can use the position to turn the neck toward
+  the target, and the size to tell how close something is
 
 Combine perception with action, e.g. read distance before walking to avoid collisions, read touch
 to react when the robot is petted, or read the IMU to right itself if it seems unbalanced.
@@ -857,7 +950,9 @@ Each sensor can also be explicitly switched on or off with the matching bittle_a
 and bittle_deactivate_* tools (bittle_activate_light / bittle_deactivate_light,
 bittle_activate_distance / bittle_deactivate_distance, bittle_activate_touch /
 bittle_deactivate_touch, bittle_activate_back_touch / bittle_deactivate_back_touch,
-bittle_activate_gesture / bittle_deactivate_gesture). The read tools already enable the
+bittle_activate_gesture / bittle_deactivate_gesture, bittle_activate_vision /
+bittle_deactivate_vision). bittle_activate_vision also has a "reactions" option that makes the
+dog track the target with its head. The read tools already enable the
 mode they need, so this is only necessary when you want to switch sensor modes yourself.
 
 ## Guidelines
