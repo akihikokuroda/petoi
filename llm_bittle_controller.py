@@ -37,6 +37,12 @@ class ToolResult:
         return result
 
 
+# Map of detected-class index -> human name, for the currently deployed
+# Grove Vision AI V2 YOLO model. The index order is defined by the model's
+# training dataset (SenseCraft) — confirm it matches YOUR model.
+GESTURE_CLASSES = {0: "rock", 1: "paper", 2: "scissors"}
+
+
 class LLMBittleController:
     """Bridge between ollama LLM and Petoi Bittle robot"""
 
@@ -285,7 +291,7 @@ class LLMBittleController:
             },
             {
                 "name": "bittle_read_vision",
-                "description": "Wait for and read one camera detection from the Vision AI (Grove Vision AI V2). Returns the target's position (x, y in the 240x240 frame, centered so -120..120), its size, and a position label. Ask the user to put a face, an animal, or a clear object in front of the camera while this runs.",
+                "description": "Wait for and read one camera detection from the Vision AI (Grove Vision AI V2). Returns the target's position (x, y in the 240x240 frame, centered so -120..120), its size, a position label, and — when the deployed model provides it — the detected object (e.g. rock/paper/scissors) with a confidence score. Ask the user to put a face, an animal, or a clear object in front of the camera while this runs.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -418,9 +424,14 @@ class LLMBittleController:
             )
 
         success = await self.bittle.execute_skill(skill_name)
+        message = (
+            f"Executed skill: {skill_name}"
+            if success
+            else f"Failed to execute skill: {skill_name} — the command was not sent to the robot"
+        )
         return ToolResult(
             success=success,
-            message=f"Executed skill: {skill_name}",
+            message=message,
             data={"skill": skill_name},
         )
 
@@ -662,9 +673,16 @@ class LLMBittleController:
                     success=False,
                     message="No detection received in time — ask the user to put a face, an animal, or a clear object steadily in front of the camera",
                 )
+            if reading.target is not None:
+                object_name = GESTURE_CLASSES.get(reading.target, f"class {reading.target}")
+                object_desc = f"{object_name} (class {reading.target}, confidence {reading.score})"
+            else:
+                object_desc = None
             return ToolResult(
                 success=True,
-                message=f"Vision target at x={reading.x}, y={reading.y}, size={reading.size} — {reading.position}",
+                message=(f"Vision target at x={reading.x}, y={reading.y}, size={reading.size}"
+                         + (f", object={object_desc}" if object_desc else "")
+                         + f" — {reading.position}"),
                 data=reading.to_dict(),
             )
         except Exception as e:
@@ -938,10 +956,12 @@ Use the sensor tools to react to the world around the robot:
 - bittle_read_gesture — a hand gesture (up / down / left / right); ask the user to wave a hand
   near the robot while it runs
 - bittle_read_vision — one detection from the Vision AI camera: target position (x, y in the
-  240x240 frame, centered -120..120), size, and a position label (e.g. "upper left", "center");
-  ask the user to put a face, an animal, or a clear object in front of the camera while it runs.
-  A larger size means the target is closer. You can use the position to turn the neck toward
-  the target, and the size to tell how close something is
+  240x240 frame, centered -120..120), size, a position label (e.g. "upper left", "center"),
+  and — when the deployed model provides it — the detected object (e.g. rock/paper/scissors)
+  with a confidence score; ask the user to put a face, an animal, or a clear object in front
+  of the camera while it runs. A larger size means the target is closer. You can use the
+  position to turn the neck toward the target, the size to tell how close something is,
+  and the object name to react to what it is
 
 Combine perception with action, e.g. read distance before walking to avoid collisions, read touch
 to react when the robot is petted, or read the IMU to right itself if it seems unbalanced.

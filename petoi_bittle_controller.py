@@ -207,12 +207,17 @@ class VisionSensorReading:
     x, y: target position in the 240x240 camera frame (0-240); pushed
     lines are centered (value - 120), so they range roughly -120..120.
     size: width of the detected target box (larger = closer/bigger).
+    target: detected class index (model-specific, e.g. 0/1/2 for a
+      rock/paper/scissors gesture model). Present only on the YOLO path.
+    score: detection confidence (0-100).
     """
     timestamp: datetime = field(default_factory=lambda: datetime.now())
     x: Optional[int] = None
     y: Optional[int] = None
     size: Optional[int] = None
     height: Optional[int] = None
+    target: Optional[int] = None
+    score: Optional[int] = None
     position: Optional[str] = None
     raw_value: Optional[str] = None
 
@@ -223,6 +228,8 @@ class VisionSensorReading:
             "y": self.y,
             "size": self.size,
             "height": self.height,
+            "target": self.target,
+            "score": self.score,
             "position": self.position,
             "raw_value": self.raw_value,
         }
@@ -237,7 +244,8 @@ VISION_FRAME_RANGE = 240
 # The one-shot "XCp" reply is the same line prefixed with "=".
 VISION_RESULT_RE = re.compile(
     r"^\s*=?\s*(-?\d+(?:\.\d+)?)\s*[\t ]\s*(-?\d+(?:\.\d+)?)\s*[\t ]\s*"
-    r"size = (-?\d+(?:\.\d+)?)\s*(?:[\t ]\s*(-?\d+(?:\.\d+)?))?\s*$"
+    r"size = (-?\d+(?:\.\d+)?)\s*(?:[\t ]\s*(-?\d+(?:\.\d+)?))?"
+    r"(?:\s*target = (-?\d+(?:\.\d+)?)\s*score = (-?\d+(?:\.\d+)?))?\s*$"
 )
 
 
@@ -506,29 +514,61 @@ class BittleBLEController:
                     return False
 
             print(f"\nConnecting to {self.address}...")
-            self.client = BleakClient(self.address)
-            await self.client.connect()
-            self.connected = True
-            print(f"✓ Connected to Bittle")
-
-            # Find writable characteristic
-            self.char = await self.find_writable_characteristic()
-            if not self.char:
-                print("❌ Could not find writable characteristic")
-                await self.disconnect()
-                return False
-
-            # Find notify characteristic for responses
-            self.notify_char = await self.find_notify_characteristic()
-            if self.notify_char and "notify" in self.notify_char.properties:
-                await self.client.start_notify(self.notify_char, self._notification_handler)
-                print(f"Notification handler enabled")
-
-            await asyncio.sleep(0.5)
-            return True
+            return await self._establish()
         except Exception as e:
             print(f"❌ Connection failed: {e}")
             return False
+
+    async def _establish(self) -> bool:
+        """(Re)create the BLE link and (re)discover the GATT characteristics.
+
+        Every successful call leaves ``client``, ``char`` and ``notify_char``
+        pointing at a freshly connected BleakClient — bleak's macOS
+        (CoreBluetooth) backend drops its service cache when the robot ends
+        the link, so a reconnection must go through this path instead of
+        reusing the old characteristic objects.
+        """
+        self.client = BleakClient(self.address)
+        await self.client.connect()
+        self.connected = True
+        print("✓ Connected to Bittle")
+
+        # Find writable characteristic
+        self.char = await self.find_writable_characteristic()
+        if not self.char:
+            print("❌ Could not find writable characteristic")
+            await self.disconnect()
+            return False
+
+        # Find notify characteristic for responses
+        self.notify_char = await self.find_notify_characteristic()
+        if self.notify_char and "notify" in self.notify_char.properties:
+            await self.client.start_notify(self.notify_char, self._notification_handler)
+            print(f"Notification handler enabled")
+
+        await asyncio.sleep(0.5)
+        return True
+
+    async def reconnect(self) -> bool:
+        """Re-establish the link after the robot (or macOS) dropped it."""
+        print("↻ Connection lost — reconnecting to Bittle...")
+        await self.disconnect()
+        if not self.address:
+            self.address = await self.discover_bittle()
+            if self.address is None:
+                return False
+        try:
+            return await self._establish()
+        except Exception as e:
+            print(f"❌ Reconnect failed: {e}")
+            self.connected = False
+            return False
+
+    async def _ensure_connected(self) -> bool:
+        """True if the BLE link is up; otherwise attempt one reconnect."""
+        if self.connected and self.client and self.char:
+            return True
+        return await self.reconnect()
 
     async def disconnect(self):
         """Disconnect from the Bittle."""
@@ -552,7 +592,7 @@ class BittleBLEController:
         Returns:
             True if sent successfully, False otherwise.
         """
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return False
 
@@ -564,6 +604,17 @@ class BittleBLEController:
             return True
         except Exception as e:
             print(f"❌ Failed to send command: {e}")
+            # The robot (or macOS CoreBluetooth) most likely dropped the link:
+            # bleak raises "Service Discovery has not been performed yet" once
+            # the GATT cache is gone. Re-establish the link once and retry.
+            if await self.reconnect():
+                try:
+                    await self.client.write_gatt_char(self.char, cmd_bytes)
+                    print(f"→ Sent: {command} (after reconnect)")
+                    await asyncio.sleep(self.command_delay)
+                    return True
+                except Exception as e2:
+                    print(f"❌ Still failing after reconnect: {e2}")
             self.connected = False
             return False
 
@@ -690,7 +741,7 @@ class BittleBLEController:
             command: Raw command to send (default: left sensor, 'Ra"')
             timeout: Response timeout in seconds (default: 2.0)
         """
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return None
 
@@ -764,7 +815,7 @@ class BittleBLEController:
         if not command:
             print(f"❌ Unknown distance side: '{side}' (expected 'L' or 'R')")
             return None
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return None
 
@@ -861,7 +912,7 @@ class BittleBLEController:
         if not command:
             print(f"❌ Unknown touch side: '{side}' (expected 'L' or 'R')")
             return None
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return None
 
@@ -950,7 +1001,7 @@ class BittleBLEController:
         location. Returns a BackTouchSensorReading, or None if no response.
         """
         command = self.resolve_back_touch_command()
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return None
 
@@ -1086,7 +1137,7 @@ class BittleBLEController:
         Args:
             timeout: Wait timeout in seconds (default: 2.0)
         """
-        if not self.connected:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return None
 
@@ -1160,7 +1211,7 @@ class BittleBLEController:
         (showModuleStatus) goes to the USB serial port only, so it never
         arrives over BLE — a successful write is our confirmation here.
         """
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return False
 
@@ -1177,7 +1228,7 @@ class BittleBLEController:
 
     async def deactivate_gesture_mode(self) -> bool:
         """Disable the gesture module (Xg) and stop the value stream."""
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return False
 
@@ -1230,7 +1281,7 @@ class BittleBLEController:
         Args:
             timeout: How long to wait for a gesture, in seconds
         """
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return None
 
@@ -1313,7 +1364,7 @@ class BittleBLEController:
         coordinates change — keep moving in front of the camera to see
         updates, the same way a gesture has to change to be streamed.
         """
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return False
 
@@ -1330,7 +1381,7 @@ class BittleBLEController:
 
     async def deactivate_vision_mode(self) -> bool:
         """Disable the Vision AI camera module (Xc) and stop the stream."""
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return False
 
@@ -1397,7 +1448,9 @@ class BittleBLEController:
         firmware pushes a result line every time the detected coordinates
         change, so this method enables the stream if needed, then waits up
         to `timeout` seconds for a pushed line, skipping unrelated traffic
-        on the BLE channel.
+        on the BLE channel. A single result line typically arrives split
+        across several BLE notifications, so the fragments of each burst are
+        reassembled (joined with spaces) before being matched.
 
         Move in front of the camera (a face, an animal, or a clear
         object) while it is waiting — a completely still target is only
@@ -1406,7 +1459,7 @@ class BittleBLEController:
         Args:
             timeout: How long to wait for a detection, in seconds
         """
-        if not self.connected or not self.client or not self.char:
+        if not await self._ensure_connected():
             print("❌ Not connected to Bittle")
             return None
 
@@ -1431,15 +1484,30 @@ class BittleBLEController:
                 print("  Keep a face/animal/object steadily in front of the camera")
                 return None
             try:
-                message = await asyncio.wait_for(
+                first = await asyncio.wait_for(
                     self.sensor_response_queue.get(), timeout=remaining
                 )
             except asyncio.TimeoutError:
                 print("⚠ No detection received in time")
                 return None
-            if self._is_vision_result(message):
-                return self.parse_vision_response(message)
-            # anything else (reaction echoes, status text, ...) is ignored
+
+            # A pushed result line is delivered as several back-to-back BLE
+            # notifications (one per token), so gather the rest of the burst
+            # before matching. The tokens are whitespace-delimited on the wire,
+            # so join with a space (VISION_RESULT_RE accepts tabs or spaces).
+            fragments = [first]
+            await asyncio.sleep(0.1)
+            while not self.sensor_response_queue.empty():
+                try:
+                    fragments.append(self.sensor_response_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            candidate = " ".join(fragments).strip()
+            if self._is_vision_result(candidate):
+                return self.parse_vision_response(candidate)
+            # Not a vision line (interleaved noise or an incomplete burst) —
+            # keep waiting for the next burst within the overall timeout.
 
     def parse_vision_response(self, response: str) -> Optional[VisionSensorReading]:
         """Parse a camera result line from the Bittle.
@@ -1456,9 +1524,12 @@ class BittleBLEController:
             y = int(float(match.group(2)))
             size = int(float(match.group(3)))
             height = int(float(match.group(4))) if match.group(4) is not None else None
+            target = int(float(match.group(5))) if match.group(5) is not None else None
+            score = int(float(match.group(6))) if match.group(6) is not None else None
             position = self._vision_position_label(x, y)
             reading = VisionSensorReading(
                 x=x, y=y, size=size, height=height,
+                target=target, score=score,
                 position=position, raw_value=response,
             )
             self.last_vision_reading = reading

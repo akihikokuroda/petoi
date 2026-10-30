@@ -454,9 +454,14 @@ class LLMBittleController:
             )
 
         success = await self.bittle.execute_skill(skill_name)
+        message = (
+            f"Executed skill: {skill_name}"
+            if success
+            else f"Failed to execute skill: {skill_name} — the command was not sent to the robot"
+        )
         return ToolResult(
             success=success,
-            message=f"Executed skill: {skill_name}",
+            message=message,
             data={"skill": skill_name},
         )
 
@@ -484,9 +489,14 @@ class LLMBittleController:
         motor_index = motor_map[motor_name]
         success = await self.bittle.execute_motor(motor_index, angle)
 
+        message = (
+            f"Moved {motor_name} to {angle}°"
+            if success
+            else f"Failed to move {motor_name} to {angle}° — the command was not sent to the robot"
+        )
         return ToolResult(
             success=success,
-            message=f"Moved {motor_name} to {angle}°",
+            message=message,
             data={"motor": motor_name, "angle": angle},
         )
 
