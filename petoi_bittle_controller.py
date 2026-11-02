@@ -243,9 +243,9 @@ VISION_FRAME_RANGE = 240
 # src/camera.h: "<x><tab><y><tab>size = <width><tab><height>?"
 # The one-shot "XCp" reply is the same line prefixed with "=".
 VISION_RESULT_RE = re.compile(
-    r"^\s*=?\s*(-?\d+(?:\.\d+)?)\s*[\t ]\s*(-?\d+(?:\.\d+)?)\s*[\t ]\s*"
-    r"size = (-?\d+(?:\.\d+)?)\s*(?:[\t ]\s*(-?\d+(?:\.\d+)?))?"
-    r"(?:\s*target = (-?\d+(?:\.\d+)?)\s*score = (-?\d+(?:\.\d+)?))?\s*$"
+    r"=?\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+"
+    r"size = (-?\d+(?:\.\d+)?)(?:\s+(-?\d+(?:\.\d+)?))?"
+    r"(?:\s*target = (-?\d+(?:\.\d+)?)\s*score = (-?\d+(?:\.\d+)?))?"
 )
 
 
@@ -549,20 +549,36 @@ class BittleBLEController:
         await asyncio.sleep(0.5)
         return True
 
-    async def reconnect(self) -> bool:
-        """Re-establish the link after the robot (or macOS) dropped it."""
+    async def reconnect(self, attempts: int = 3) -> bool:
+        """Re-establish the link after the robot (or macOS) dropped it.
+
+        The Bittle's BLE stack is single-connection and slow to release the
+        old link, and CoreBluetooth tears the link down asynchronously, so an
+        immediate reconnection attempt usually fails (bleak raises
+        ``BleakError("disconnected")`` for any in-flight operation that the
+        disconnect interrupts). Retry a few times with growing delays to let
+        both sides finish releasing the previous link.
+        """
         print("↻ Connection lost — reconnecting to Bittle...")
         await self.disconnect()
         if not self.address:
             self.address = await self.discover_bittle()
             if self.address is None:
                 return False
-        try:
-            return await self._establish()
-        except Exception as e:
-            print(f"❌ Reconnect failed: {e}")
-            self.connected = False
-            return False
+
+        last_error = "unknown error"
+        for attempt in range(1, attempts + 1):
+            # Give CoreBluetooth and the robot's BLE stack time to release
+            # the previous link before trying again.
+            await asyncio.sleep(0.5 * attempt)
+            try:
+                return await self._establish()
+            except Exception as e:
+                last_error = e
+                print(f"↻ Reconnect attempt {attempt}/{attempts} failed: {e}")
+        print(f"❌ Reconnect failed: {last_error}")
+        self.connected = False
+        return False
 
     async def _ensure_connected(self) -> bool:
         """True if the BLE link is up; otherwise attempt one reconnect."""
@@ -1415,8 +1431,10 @@ class BittleBLEController:
         Format (showRecognitionResult in src/camera.h):
           x<tab>y<tab>size = width<tab>height?
         The one-shot "XCp" reply is the same line prefixed with "=".
+        Uses search (not match) so a valid line is still found when a
+        stray message is glued to the front of the reassembled burst.
         """
-        return VISION_RESULT_RE.match(message) is not None
+        return VISION_RESULT_RE.search(message) is not None
 
     @staticmethod
     def _vision_position_label(x: int, y: int) -> str:
@@ -1467,12 +1485,19 @@ class BittleBLEController:
             if not await self.activate_vision_mode():
                 return None
 
-        # Drop stale messages left over from earlier commands
+        # Messages already queued may include a detection burst that arrived
+        # while vision_on was still printing — don't drop that: try it first,
+        # and only discard it if it isn't a valid result line.
+        pending = []
         while not self.sensor_response_queue.empty():
             try:
-                self.sensor_response_queue.get_nowait()
+                pending.append(self.sensor_response_queue.get_nowait())
             except asyncio.QueueEmpty:
                 break
+        if pending:
+            candidate = " ".join(pending).strip()
+            if self._is_vision_result(candidate):
+                return self.parse_vision_response(candidate)
 
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
@@ -1513,10 +1538,11 @@ class BittleBLEController:
         """Parse a camera result line from the Bittle.
 
         Accepts the streamed line ("x\\ty\\tsize = w[\\th]") as well as the
-        one-shot "XCp" reply ("=x\\ty\\tsize = w[\\th]").
+        one-shot "XCp" reply ("=x\\ty\\tsize = w[\\th]"). search() is used
+        so a stray message glued to the front of the line doesn't hide it.
         """
         try:
-            match = VISION_RESULT_RE.match(response.strip())
+            match = VISION_RESULT_RE.search(response.strip())
             if not match:
                 print(f"❌ No vision result in response: {response!r}")
                 return None
