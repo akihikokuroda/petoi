@@ -825,12 +825,16 @@ in one short sentence.
         answers here are short English sentences, so a long reply where most
         'words' are not clean ASCII words (and it contains non-ASCII garbage)
         is treated as degenerate. Looping degeneration (one word repeated
-        over and over) is caught separately.
+        over and over) is caught separately — but punctuation-only tokens
+        (list bullets like '- sit / - stand') must not count as the
+        "repeated word", or a plain bulleted skill list gets discarded.
         """
         text = text.strip()
         if len(text) < 150:
             return False
-        words = text.split()
+        # Drop punctuation-only tokens (bullets, stray dashes): they carry
+        # no signal and would otherwise distort both heuristics.
+        words = [w for w in text.split() if any(c.isalnum() for c in w)]
         if not words:
             return False
         good = sum(
@@ -840,10 +844,12 @@ in one short sentence.
         non_ascii = sum(1 for ch in text if ord(ch) > 0x2018) / len(text)
         if word_ratio < 0.8 and non_ascii > 0.05:
             return True
-        # Looping degeneration: the same word dominates a long output.
-        if len(words) >= 20:
-            top = max(set(words), key=words.count)
-            if words.count(top) / len(words) > 0.35:
+        # Looping degeneration: the same *alphanumeric* word dominates a long
+        # output.
+        real_words = [w for w in words if re.fullmatch(r"[A-Za-z0-9]{2,}", w)]
+        if len(real_words) >= 20:
+            top = max(set(real_words), key=real_words.count)
+            if real_words.count(top) / len(real_words) > 0.35:
                 return True
         return False
 

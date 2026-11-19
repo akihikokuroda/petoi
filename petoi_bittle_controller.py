@@ -547,17 +547,27 @@ class BittleBLEController:
             print(f"Notification handler enabled")
 
         await asyncio.sleep(0.5)
+        if not self.client.is_connected:
+            # The robot accepted the connection but dropped it again while we
+            # were setting up (its nRF stack is slow to release the previous
+            # link). Don't hand back a dead client — writes on it fail with
+            # GATT "Unlikely Error".
+            print("❌ Robot dropped the link during setup")
+            await self.disconnect()
+            return False
         return True
 
-    async def reconnect(self, attempts: int = 3) -> bool:
-        """Re-establish the link after the robot (or macOS) dropped it.
+    async def reconnect(self, attempts: int = 4) -> bool:
+        """Re-establish the link after the robot (or the OS stack) dropped it.
 
         The Bittle's BLE stack is single-connection and slow to release the
-        old link, and CoreBluetooth tears the link down asynchronously, so an
-        immediate reconnection attempt usually fails (bleak raises
-        ``BleakError("disconnected")`` for any in-flight operation that the
-        disconnect interrupts). Retry a few times with growing delays to let
-        both sides finish releasing the previous link.
+        old link, and the OS stack (BlueZ on Linux, CoreBluetooth on macOS)
+        tears the link down asynchronously, so an early reconnection attempt
+        usually fails: bleak raises
+        ``BleakError("failed to discover services, device disconnected")``
+        when the robot lets go in the middle of service discovery. Retry a
+        few times with growing delays to let both sides finish releasing the
+        previous link.
         """
         print("↻ Connection lost — reconnecting to Bittle...")
         await self.disconnect()
@@ -568,9 +578,10 @@ class BittleBLEController:
 
         last_error = "unknown error"
         for attempt in range(1, attempts + 1):
-            # Give CoreBluetooth and the robot's BLE stack time to release
-            # the previous link before trying again.
-            await asyncio.sleep(0.5 * attempt)
+            # Give the OS BLE stack and the robot's nRF stack time to release
+            # the previous link before trying again. The robot needs several
+            # seconds; 0.5s increments were not enough on BlueZ.
+            await asyncio.sleep(1.0 * attempt)
             try:
                 return await self._establish()
             except Exception as e:
@@ -598,41 +609,46 @@ class BittleBLEController:
             self.connected = False
             print("✓ Disconnected")
 
-    async def send_command(self, command: str) -> bool:
+    async def send_command(self, command: str, retries: int = 3) -> bool:
         """
         Send a command to the Bittle.
 
+        The robot drops an idle BLE link within seconds (its nRF stack's
+        supervision timeout is short), and every command here is issued
+        after a multi-second LLM round, so the link is usually cold when we
+        get here. Check the *live* link state, re-establish it as needed,
+        and retry the write a few times.
+
         Args:
             command: The command string to send.
+            retries: How many connect/write cycles to attempt.
 
         Returns:
             True if sent successfully, False otherwise.
         """
-        if not await self._ensure_connected():
-            print("❌ Not connected to Bittle")
-            return False
-
-        try:
-            cmd_bytes = command.encode()
-            await self.client.write_gatt_char(self.char, cmd_bytes)
-            print(f"→ Sent: {command}")
-            await asyncio.sleep(self.command_delay)
-            return True
-        except Exception as e:
-            print(f"❌ Failed to send command: {e}")
-            # The robot (or macOS CoreBluetooth) most likely dropped the link:
-            # bleak raises "Service Discovery has not been performed yet" once
-            # the GATT cache is gone. Re-establish the link once and retry.
-            if await self.reconnect():
+        cmd_bytes = command.encode()
+        last_error = "unknown error"
+        for attempt in range(1, retries + 1):
+            # client.is_connected is the real link state — self.connected is
+            # a local flag the robot can outlive, and bleak raises
+            # "Service Discovery has not been performed yet" once the GATT
+            # cache of a dead link is gone.
+            if self.client and self.char and self.client.is_connected:
                 try:
                     await self.client.write_gatt_char(self.char, cmd_bytes)
-                    print(f"→ Sent: {command} (after reconnect)")
+                    print(f"→ Sent: {command}")
                     await asyncio.sleep(self.command_delay)
                     return True
-                except Exception as e2:
-                    print(f"❌ Still failing after reconnect: {e2}")
-            self.connected = False
-            return False
+                except Exception as e:
+                    last_error = e
+                    print(f"❌ Failed to send command: {e}")
+            else:
+                print(f"↻ Link down before attempt {attempt}/{retries} — reconnecting...")
+            if not await self.reconnect():
+                break
+        self.connected = False
+        print(f"❌ Could not send '{command}': {last_error}")
+        return False
 
     def validate_motor_command(self, index: int, angle: int) -> Tuple[bool, str]:
         """Validate motor command parameters."""
