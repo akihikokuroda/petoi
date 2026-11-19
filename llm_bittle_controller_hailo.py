@@ -13,7 +13,7 @@ Prerequisites:
   3. The `hailo-ollama` server running (listens on http://localhost:8000 by default)
   4. A model pulled into the local model store, e.g.:
        curl http://localhost:8000/api/pull -H 'Content-Type: application/json' \
-            -d '{ "model": "qwen2:1.5b", "stream": true }'
+            -d '{ "model": "qwen3:4b", "stream": true }'
      See `curl http://localhost:8000/hailo/v1/list` for the exact model IDs
      of everything available for download.
 
@@ -25,6 +25,7 @@ code already does that). Hailo models use a 2048-token context window.
 import asyncio
 import json
 import logging
+import re
 import os
 import sys
 import time
@@ -79,7 +80,7 @@ class LLMBittleController:
         #   Qwen2-1.5B-Instruct-Function-Calling-v1 (fine-tuned for tool calling)
         # Vision-language (Qwen3-VL / Qwen2-VL) and Whisper models support
         # C++/Python only — not the Ollama API.
-        self.model = os.environ.get("HAILO_MODEL", "qwen2:1.5b")
+        self.model = os.environ.get("HAILO_MODEL", "qwen3:4b")
         self.conversation_history = []
         if debug is None:
             debug = os.environ.get("BITTLE_DEBUG", "").strip().lower() in (
@@ -252,204 +253,34 @@ class LLMBittleController:
                 },
             },
             {
-                "name": "bittle_read_light",
-                "description": "Read the ambient light sensor(s). Returns a brightness/ADC value per side; side 'both' reads left and right.",
+                "name": "bittle_sensor",
+                "description": "Use a Bittle sensor. action 'read' takes one measurement; 'activate'/'deactivate' start/stop the continuous stream.",
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "What to do with the sensor",
+                            "enum": ["read", "activate", "deactivate"],
+                        },
+                        "sensor": {
+                            "type": "string",
+                            "description": "light=brightness, distance=IR proximity, touch=front pad, back_touch=back pad, imu=balance/orientation, gesture=hand wave, vision=Vision AI camera (target position, size, object)",
+                            "enum": ["light", "distance", "touch", "back_touch", "imu", "gesture", "vision"],
+                        },
                         "side": {
                             "type": "string",
-                            "description": "Sensor to read: 'L' (left), 'R' (right), or 'both' (default)",
+                            "description": "Which side, when reading light/distance/touch (default: both)",
                             "enum": ["L", "R", "both"],
                             "default": "both",
-                        }
-                    },
-                },
-            },
-            {
-                "name": "bittle_read_distance",
-                "description": "Read the IR distance sensor(s). Returns a raw ADC value per side (a closer object gives a lower value); side 'both' reads left and right.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "side": {
-                            "type": "string",
-                            "description": "Sensor to read: 'L' (left), 'R' (right), or 'both' (default)",
-                            "enum": ["L", "R", "both"],
-                            "default": "both",
-                        }
-                    },
-                },
-            },
-            {
-                "name": "bittle_read_touch",
-                "description": "Read the touch pad(s). Returns 1 (touched) or 0 (not touched) per side; side 'both' reads left and right.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "side": {
-                            "type": "string",
-                            "description": "Pad to read: 'L' (left), 'R' (right), or 'both' (default)",
-                            "enum": ["L", "R", "both"],
-                            "default": "both",
-                        }
-                    },
-                },
-            },
-            {
-                "name": "bittle_read_back_touch",
-                "description": "Read the back touch sensor. Returns which of the four pads was touched (Front Left / Front Right / Center / Back).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_read_imu",
-                "description": "Read the IMU (accelerometer and gyroscope). Returns accel_x/y/z and gyro_x/y/z, useful for balance and orientation.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_read_gesture",
-                "description": "Wait for and read a hand gesture (up / down / left / right). Ask the user to wave a hand near the robot while this runs.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "timeout": {
-                            "type": "number",
-                            "description": "How long to wait for a gesture, in seconds (default: 5)",
-                            "default": 5,
-                            "minimum": 1,
-                            "maximum": 10,
-                        }
-                    },
-                },
-            },
-            {
-                "name": "bittle_read_vision",
-                "description": "Wait for and read one camera detection from the Vision AI (Grove Vision AI V2). Returns the target's position (x, y in the 240x240 frame, centered so -120..120), its size, a position label, and — when the deployed model provides it — the detected object (e.g. rock/paper/scissors) with a confidence score. Ask the user to put a face, an animal, or a clear object in front of the camera while this runs.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "timeout": {
-                            "type": "number",
-                            "description": "How long to wait for a detection, in seconds (default: 10)",
-                            "default": 10,
-                            "minimum": 1,
-                            "maximum": 30,
-                        }
-                    },
-                },
-            },
-            {
-                "name": "bittle_activate_light",
-                "description": "Activate the light sensor mode (enables the light module on the shared sensor pins).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_activate_distance",
-                "description": "Activate the IR distance sensor mode (enables the distance module on the shared sensor pins).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_activate_touch",
-                "description": "Activate the touch sensor mode (enables the touch module on the shared sensor pins).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_activate_back_touch",
-                "description": "Activate the back touch sensor mode (enables the 4-pad back touch module).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_activate_gesture",
-                "description": "Activate the gesture sensor and start the continuous value stream. Optionally let the dog react (sit/scratch/head turn) to each gesture.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
+                        },
                         "reactions": {
                             "type": "boolean",
-                            "description": "Whether the robot should react to gestures (default: false, stays still)",
+                            "description": "For gesture/vision: let the robot react (default: false)",
                             "default": False,
-                        }
+                        },
                     },
-                },
-            },
-            {
-                "name": "bittle_activate_vision",
-                "description": "Activate the Vision AI camera and start the continuous detection stream. Optionally let the dog track the target with its head (reactions).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reactions": {
-                            "type": "boolean",
-                            "description": "Whether the robot should track the target with its head (default: false, stays still)",
-                            "default": False,
-                        }
-                    },
-                },
-            },
-            {
-                "name": "bittle_deactivate_light",
-                "description": "Deactivate the light sensor mode (turns the light module off on the shared sensor pins).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_deactivate_distance",
-                "description": "Deactivate the IR distance sensor mode (turns the distance module off).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_deactivate_touch",
-                "description": "Deactivate the touch sensor mode (turns the touch module off).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_deactivate_back_touch",
-                "description": "Deactivate the back touch sensor mode (turns the 4-pad back touch module off).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_deactivate_gesture",
-                "description": "Deactivate the gesture sensor and stop the continuous value stream.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "bittle_deactivate_vision",
-                "description": "Deactivate the Vision AI camera and stop the continuous detection stream.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
+                    "required": ["action", "sensor"],
                 },
             },
         ]
@@ -886,6 +717,48 @@ class LLMBittleController:
         except Exception as e:
             return ToolResult(success=False, message=f"Failed to deactivate vision camera: {e}")
 
+    async def use_sensor(self, tool_input: dict) -> ToolResult:
+        """Route a bittle_sensor call to the underlying sensor methods."""
+        sensor = str(tool_input.get("sensor", "")).lower().replace("-", "_")
+        action = str(tool_input.get("action", "read")).lower()
+        side = tool_input.get("side", "both")
+        reactions = bool(tool_input.get("reactions", False))
+
+        if action == "read":
+            readers = {
+                "light": self.read_light,
+                "distance": self.read_distance,
+                "touch": self.read_touch,
+            }
+            if sensor in readers:
+                return await readers[sensor](side)
+            if sensor == "back_touch":
+                return await self.read_back_touch()
+            if sensor == "imu":
+                return await self.read_imu()
+            if sensor == "gesture":
+                return await self.read_gesture(tool_input.get("timeout", 5.0))
+            if sensor == "vision":
+                return await self.read_vision(tool_input.get("timeout", 10.0))
+            return ToolResult(success=False, message=f"Unknown sensor: {sensor}")
+
+        if action in ("activate", "deactivate"):
+            if sensor in ("gesture", "vision"):
+                if action == "activate":
+                    return await getattr(self, f"activate_{sensor}")(reactions)
+                return await getattr(self, f"deactivate_{sensor}")()
+            if sensor in ("light", "distance", "touch", "back_touch"):
+                return await getattr(self, f"{action}_{sensor}")()
+            return ToolResult(
+                success=False,
+                message=f"Sensor '{sensor}' does not support action '{action}' (imu is read-only)",
+            )
+
+        return ToolResult(
+            success=False,
+            message=f"Unknown sensor action: {action} (use read/activate/deactivate)",
+        )
+
     async def process_tool_call(self, tool_name: str, tool_input: dict) -> str:
         """Process a tool call from the LLM"""
         logger.debug("tool call: %s args=%s", tool_name, tool_input)
@@ -914,44 +787,8 @@ class LLMBittleController:
                 tool_input["motor_name"],
                 tool_input.get("offset", 0),
             )
-        elif tool_name == "bittle_read_light":
-            result = await self.read_light(tool_input.get("side", "both"))
-        elif tool_name == "bittle_read_distance":
-            result = await self.read_distance(tool_input.get("side", "both"))
-        elif tool_name == "bittle_read_touch":
-            result = await self.read_touch(tool_input.get("side", "both"))
-        elif tool_name == "bittle_read_back_touch":
-            result = await self.read_back_touch()
-        elif tool_name == "bittle_read_imu":
-            result = await self.read_imu()
-        elif tool_name == "bittle_read_gesture":
-            result = await self.read_gesture(tool_input.get("timeout", 5.0))
-        elif tool_name == "bittle_read_vision":
-            result = await self.read_vision(tool_input.get("timeout", 10.0))
-        elif tool_name == "bittle_activate_light":
-            result = await self.activate_light()
-        elif tool_name == "bittle_activate_distance":
-            result = await self.activate_distance()
-        elif tool_name == "bittle_activate_touch":
-            result = await self.activate_touch()
-        elif tool_name == "bittle_activate_back_touch":
-            result = await self.activate_back_touch()
-        elif tool_name == "bittle_activate_gesture":
-            result = await self.activate_gesture(tool_input.get("reactions", False))
-        elif tool_name == "bittle_activate_vision":
-            result = await self.activate_vision(tool_input.get("reactions", False))
-        elif tool_name == "bittle_deactivate_light":
-            result = await self.deactivate_light()
-        elif tool_name == "bittle_deactivate_distance":
-            result = await self.deactivate_distance()
-        elif tool_name == "bittle_deactivate_touch":
-            result = await self.deactivate_touch()
-        elif tool_name == "bittle_deactivate_back_touch":
-            result = await self.deactivate_back_touch()
-        elif tool_name == "bittle_deactivate_gesture":
-            result = await self.deactivate_gesture()
-        elif tool_name == "bittle_deactivate_vision":
-            result = await self.deactivate_vision()
+        elif tool_name == "bittle_sensor":
+            result = await self.use_sensor(tool_input)
         else:
             result = ToolResult(success=False, message=f"Unknown tool: {tool_name}")
             logger.debug("unknown tool requested: %s", tool_name)
@@ -968,76 +805,47 @@ class LLMBittleController:
 
     def get_system_prompt(self) -> str:
         """Return the system prompt for the Hailo LLM"""
-        return """You are a helpful assistant that controls a Petoi Bittle robot. You have access to tools
-that allow you to make the robot move, execute behaviors, and query its status.
+        return """You control a Petoi Bittle robot. Use the tools to act, then confirm what you did
+in one short sentence.
 
-## Core Capabilities
+- Use bittle_execute_skill for any standard motion (rest, sit, walk, dance, ...) — it is the safest option.
+- Use bittle_control_motor only for small adjustments; angles are -90 to +90 degrees.
+- Use bittle_sensor with action "read" to take one measurement, or "activate"/"deactivate" to start or
+  stop a continuous stream. For gesture/vision you can set "reactions" to true so the robot reacts
+  (e.g. the dog tracks the target with its head).
+- Be cautious: avoid extreme angles and rapid movements. If a request is impossible, say so
+  briefly and suggest an alternative."""
 
-You can control the Bittle robot through the following tools:
-1. Execute predefined skills (sit, stand, walk, etc.)
-2. Control individual servo motors for precise movements
-3. Create custom motion sequences
-4. Query robot status and battery level
-5. Make the robot beep for feedback
-6. Calibrate motors to neutral positions
-7. Read sensors to perceive the environment (light, distance, touch, IMU, gestures, vision)
+    @staticmethod
+    def _looks_garbled(text: str) -> bool:
+        """Heuristic for degenerate LLM output.
 
-## Sensors
-
-Use the sensor tools to react to the world around the robot:
-- bittle_read_light — ambient light level on each side ('L', 'R', or 'both')
-- bittle_read_distance — IR distance to nearby objects; a closer object gives a lower value
-- bittle_read_touch — front touch pads; 1 = touched, 0 = not touched
-- bittle_read_back_touch — which back pad was touched (Front Left / Front Right / Center / Back)
-- bittle_read_imu — accelerometer + gyroscope, useful for checking balance and orientation
-- bittle_read_gesture — a hand gesture (up / down / left / right); ask the user to wave a hand
-  near the robot while it runs
-- bittle_read_vision — one detection from the Vision AI camera: target position (x, y in the
-  240x240 frame, centered -120..120), size, a position label (e.g. "upper left", "center"),
-  and — when the deployed model provides it — the detected object (e.g. rock/paper/scissors)
-  with a confidence score; ask the user to put a face, an animal, or a clear object in front
-  of the camera while it runs. A larger size means the target is closer. You can use the
-  position to turn the neck toward the target, the size to tell how close something is,
-  and the object name to react to what it is
-
-Combine perception with action, e.g. read distance before walking to avoid collisions, read touch
-to react when the robot is petted, or read the IMU to right itself if it seems unbalanced.
-
-Each sensor can also be explicitly switched on or off with the matching bittle_activate_*
-and bittle_deactivate_* tools (bittle_activate_light / bittle_deactivate_light,
-bittle_activate_distance / bittle_deactivate_distance, bittle_activate_touch /
-bittle_deactivate_touch, bittle_activate_back_touch / bittle_deactivate_back_touch,
-bittle_activate_gesture / bittle_deactivate_gesture, bittle_activate_vision /
-bittle_deactivate_vision). bittle_activate_vision also has a "reactions" option that makes the
-dog track the target with its head. The read tools already enable the
-mode they need, so this is only necessary when you want to switch sensor modes yourself.
-
-## Guidelines
-
-- Always be cautious with motor commands to avoid damaging the robot
-- Motor angles must be between -90° and +90°
-- Skills are the safest way to make the robot move - use them when possible
-- Use motor control for fine adjustments or creative animations
-- Always check robot status before executing complex sequences
-- If the user asks for impossible movements, explain why and suggest alternatives
-
-## Natural Language Understanding
-
-Interpret user requests creatively:
-- "Look around" → Move neck left and right
-- "Dance" → Combine walking and trotting motions
-- "Express confusion" → Tilt neck and adjust arms
-- "Get tired" → Transition from walking to sitting down
-
-When users describe emotions or actions, break them down into robot movements that
-express those concepts.
-
-## Safety First
-
-- Before executing new motions, check the robot is connected
-- Avoid extreme angles or rapid movements that could strain servos
-- Respect the robot's physical limitations
-- Always provide feedback on what the robot is doing"""
+        When the model's context/cache overflows it emits multilingual token
+        salad — mixed-script fragments plus a few pure-ASCII words. Real
+        answers here are short English sentences, so a long reply where most
+        'words' are not clean ASCII words (and it contains non-ASCII garbage)
+        is treated as degenerate. Looping degeneration (one word repeated
+        over and over) is caught separately.
+        """
+        text = text.strip()
+        if len(text) < 150:
+            return False
+        words = text.split()
+        if not words:
+            return False
+        good = sum(
+            1 for w in words if re.fullmatch(r"[A-Za-z0-9_'’.\-!?]{2,}", w)
+        )
+        word_ratio = good / len(words)
+        non_ascii = sum(1 for ch in text if ord(ch) > 0x2018) / len(text)
+        if word_ratio < 0.8 and non_ascii > 0.05:
+            return True
+        # Looping degeneration: the same word dominates a long output.
+        if len(words) >= 20:
+            top = max(set(words), key=words.count)
+            if words.count(top) / len(words) > 0.35:
+                return True
+        return False
 
     async def chat(self, user_message: str) -> str:
         """Send a message and get a response from Hailo-Ollama, dispatching any tool calls.
@@ -1065,7 +873,13 @@ express those concepts.
                 ],
                 "tools": self.get_tools(),
                 "stream": False,
-                "temperature": 0.7,
+                # Hailo-Ollama takes sampling parameters under "options"
+                # (ModelParameters: temperature, seed, top_k, top_p, ...).
+                # Keep temperature low for stable tool calls, and cap the
+                # output: a final answer is one sentence, and a cap turns a
+                # degenerate run into a quick failure instead of a 2-minute
+                # token-salad flood.
+                "options": {"temperature": 0.2, "num_predict": 200},
             }
 
             try:
@@ -1099,6 +913,16 @@ express those concepts.
             )
 
             if not tool_calls:
+                if self._looks_garbled(content):
+                    logger.warning(
+                        "discarding garbled model output (%d chars): %r...",
+                        len(content), content[:80],
+                    )
+                    # Don't poison the history with degenerate output.
+                    return (
+                        "⚠️ The model produced unreadable output — please try again, "
+                        "or rephrase your request (e.g. 'sit down' instead of 'make bittle rest')."
+                    )
                 self.conversation_history.append(
                     {"role": "assistant", "content": content}
                 )
