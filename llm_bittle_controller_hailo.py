@@ -80,7 +80,14 @@ class LLMBittleController:
         #   Qwen2-1.5B-Instruct-Function-Calling-v1 (fine-tuned for tool calling)
         # Vision-language (Qwen3-VL / Qwen2-VL) and Whisper models support
         # C++/Python only — not the Ollama API.
-        self.model = os.environ.get("HAILO_MODEL", "qwen3:4b")
+        # Default to 1.7B: ~2x faster than qwen3:4b on the Hailo-10H with
+        # little loss for short tool-call turns (qwen2.5:1.5b is the fastest).
+        self.model = os.environ.get("HAILO_MODEL", "qwen3:1.7b")
+        # The server unloads the model from the Hailo chip this long after the
+        # last request (its built-in default is only 5 min); the next request
+        # then spends seconds loading the model before the first token. Keep
+        # it resident across a session; pass -1 to never unload.
+        self.keep_alive = int(os.environ.get("HAILO_KEEP_ALIVE", "3600"))
         self.conversation_history = []
         if debug is None:
             debug = os.environ.get("BITTLE_DEBUG", "").strip().lower() in (
@@ -853,6 +860,37 @@ in one short sentence.
                 return True
         return False
 
+    def _log_timing(self, result: dict, wall_ms: float) -> None:
+        """Log the per-request timing the Hailo-Ollama server reports.
+
+        The non-streaming /api/chat response only fills in two timing fields
+        (its DTO declares more — load_duration, prompt_eval_*, eval_duration —
+        but the server never sets them):
+        total_duration — generation time in ns (prompt processing + token
+        decoding; the server's clock starts AFTER the model load), and
+        eval_count — how many tokens were generated. So wall_ms minus
+        total_duration is mostly the model-load cost: a large gap means the
+        model was cold and had to be loaded onto the Hailo chip first.
+        """
+        total_ms = (result.get("total_duration") or 0) / 1e6
+        tokens = result.get("eval_count") or 0
+        tps = tokens / (total_ms / 1000) if total_ms else 0
+        logger.debug(
+            "hailo-ollama timing: generation=%d tok in %.0f ms (%.0f tok/s) | wall=%.0f ms",
+            tokens, total_ms, tps, wall_ms,
+        )
+        load_ms = max(0.0, wall_ms - total_ms)
+        if load_ms > 100:
+            # A cold model load shows up even without BITTLE_DEBUG, because it
+            # is otherwise invisible: the first command after an idle gap
+            # feels arbitrarily slow.
+            logger.warning(
+                "~%.0f ms of this request was spent before generation — "
+                "probably the model loading on the Hailo chip (cold start). "
+                "Raise HAILO_KEEP_ALIVE so it stays resident between commands.",
+                load_ms,
+            )
+
     async def chat(self, user_message: str) -> str:
         """Send a message and get a response from Hailo-Ollama, dispatching any tool calls.
 
@@ -879,6 +917,9 @@ in one short sentence.
                 ],
                 "tools": self.get_tools(),
                 "stream": False,
+                # Keep the model loaded on the Hailo chip between turns so a
+                # request doesn't pay the model-load cost before token 1.
+                "keep_alive": self.keep_alive,
                 # Hailo-Ollama takes sampling parameters under "options"
                 # (ModelParameters: temperature, seed, top_k, top_p, ...).
                 # Keep temperature low for stable tool calls, and cap the
@@ -895,9 +936,11 @@ in one short sentence.
                     len(payload["messages"]),
                     len(payload["tools"]),
                 )
+                request_start = time.perf_counter()
                 response = requests.post(self.ollama_url, json=payload, timeout=300)
                 response.raise_for_status()
                 result = response.json()
+                self._log_timing(result, (time.perf_counter() - request_start) * 1000)
             except requests.exceptions.RequestException as e:
                 logger.debug("hailo-ollama request failed: %s", e)
                 error_msg = f"Error communicating with Hailo-Ollama: {e}"
