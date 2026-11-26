@@ -94,6 +94,11 @@ class LLMBittleController(_HailoBackend):
             system=self.get_system_prompt(),
             weights=weights,
         )
+        # Outcome of the most recent chat() call: "action" (a tool executed),
+        # "suppressed" (engine vetoed the call), "no_call" (no tool proposed),
+        # or "error". Set in chat(); read by wrappers (the narrative controller)
+        # and the A/B harness instead of parsing the response text.
+        self.last_outcome = None
         self.max_new_tokens = int(os.environ.get("NEEDLE_MAX_NEW_TOKENS", "128"))
         self.max_steps = int(os.environ.get("NEEDLE_MAX_STEPS", "6"))
         self.reset_per_command = os.environ.get("NEEDLE_PER_COMMAND_RESET", "1").strip().lower() in (
@@ -200,6 +205,7 @@ Examples:
             response = self.agent.complete(user_message, max_new_tokens=self.max_new_tokens)
         except RuntimeError as e:
             logger.debug("needle complete() failed: %s", e)
+            self.last_outcome = "error"
             return f"⚠️ The Needle engine failed: {e}"
 
         executed = []
@@ -230,20 +236,24 @@ Examples:
         if response.get("error"):
             logger.warning("needle engine error: %s (%s)",
                            response.get("error"), response.get("error_code"))
+            self.last_outcome = "action" if executed else "error"
             if executed:
                 return self._summarize(executed)
             return "⚠️ The engine hit an error on that one — please try again."
 
         if executed:
+            self.last_outcome = "action"
             return self._summarize(executed)
 
         suppressed = response.get("suppressed_calls") or []
         if suppressed:
             # The engine proposed a call but its confidence/ungrounded-argument
             # guardrail vetoed it. Fail safe and ask for a direct command.
+            self.last_outcome = "suppressed"
             return ("I'm not sure about that one — try a direct command like "
                     "'sit down', 'walk forward', or 'beep'.")
         # No tools, no suppressed calls: a question like "what can you do?".
+        self.last_outcome = "no_call"
         return ("I can sit, stand, walk, bark, stretch, read the light/distance/touch "
                 "sensors, and more — tell me what to do.")
 

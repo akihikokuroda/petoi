@@ -1,42 +1,54 @@
 #!/usr/bin/env python3
 """
-A/B harness: run one fixed command list through one or more backends and
-tabulate what actually happened on (or would have happened on) the robot.
+A/B harness: run fixed command lists through the backends and tabulate what
+actually happened on (or would have happened on) the robot.
 
 Backends:
-  needle   llm_bittle_controller_needle  (in-process Cactus engine, no server)
-  hailo    llm_bittle_controller_hailo   (needs hailo-ollama at HAILO_OLLAMA_URL,
-                                          default http://localhost:8000)
+  needle      Needle direct (in-process Cactus engine, no server)
+  narrative   Needle + small-LLM translator fallback (needs a Hailo-Ollama or
+              LiteRT server for the fallback hop; degrades to needle without one)
+  hailo       Hailo-Ollama direct (needs the server at HAILO_OLLAMA_URL,
+              default http://localhost:8000)
 
-Usage (on the Pi, with the robot powered on and paired):
-    uv run needle_ab.py                    # Needle only, real robot
-    uv run needle_ab.py --with-hailo       # Needle + Hailo-Ollama, real robot
-    uv run needle_ab.py --dry-run          # no robot: BLE mocked, model-only
+Usage (on the Pi, robot powered on and paired):
+    uv run needle_ab.py                     # needle + narrative, real robot
+    uv run needle_ab.py --with-hailo        # three-way comparison
+    uv run needle_ab.py --dry-run           # no robot: BLE mocked, model-only
     uv run needle_ab.py --commands "sit down" "bark at me"
 
 Verdicts:
   ACTION      a tool call executed on the robot (skill/motor/beep/sensor/...)
-  SUPPRESSED  the model proposed a call but the engine vetoed it (fail-safe)
-  NO-CALL     the model produced no tool call at all
+  SUPPRESSED  the engine vetoed the proposed call (fail-safe, robot stays still)
+  NO-CALL     no tool call could be made (question / unmappable)
   ERROR       the backend errored
 
-Also doubles as the acceptance test after fine-tuning: run the same list
-with NEEDLE_WEIGHTS=<your .cact> and compare the ACTION rate.
+Also the acceptance test after fine-tuning: run with
+NEEDLE_WEIGHTS=<your .cact> and compare the ACTION rate on the narrative set.
 """
 
 import argparse
 import asyncio
-import json
 import re
-import sys
 import time
 
 import llm_bittle_controller_needle as needle_mod
+import llm_bittle_controller_narrative as narrative_mod
 import llm_bittle_controller_hailo as hailo_mod
 
-# The phrasings the base model flickers on, plus the direct ones it should
-# always get. Keep this list stable: it is the measurement baseline.
-DEFAULT_COMMANDS = [
+# --- the measurement baselines (keep stable; they ARE the test) -------------
+
+# Direct phrasings: the base model should be near 100% here.
+DIRECT_COMMANDS = [
+    "sit down",
+    "walk forward",
+    "beep",
+    "read the light sensor",
+    "stand up",
+    "bark",
+]
+
+# "make bittle ..." phrasings: the historically weak spot.
+MAKE_BITTLE_COMMANDS = [
     "make bittle sit",
     "make bittle rest",
     "make bittle walk",
@@ -44,22 +56,35 @@ DEFAULT_COMMANDS = [
     "make bittle bark at me",
     "make bittle look around",
     "make bittle tilt head to the left",
-    "sit down",
-    "walk forward",
-    "beep",
-    "read the light sensor",
-    "how bright is it on your right side?",
 ]
 
-# Verdict classification on the synthesized confirmation text.
-ACTION_RE = re.compile(r"^(Executed|Moved|Sequence|Beep|Read|Back touch|IMU|Gesture|Vision|Light|IR|Touch)", re.I)
+# Free narratives: the translator layer's job (direct Needle often vetoes).
+NARRATIVE_COMMANDS = [
+    "i had a rough day, comfort me",
+    "greet me at the door",
+    "make bittle happy",
+    "celebrate my birthday",
+    "scare the cat away",
+    "show me that you are alive",
+]
+
+SECTIONS = [
+    ("DIRECT", DIRECT_COMMANDS),
+    ("MAKE-BITTLE", MAKE_BITTLE_COMMANDS),
+    ("NARRATIVE", NARRATIVE_COMMANDS),
+]
+
+# Text-based verdict (used for the Hailo backend, whose responses are the
+# model's own words). Needle/narrative controllers expose last_outcome.
+ACTION_RE = re.compile(r"^(Executed|Moved|Sequence|Beep|Read|Back touch|Gesture|Vision|Light|IR|Touch)", re.I)
+OUTCOME_TO_VERDICT = {"action": "ACTION", "suppressed": "SUPPRESSED",
+                      "no_call": "NO-CALL", "error": "ERROR"}
 
 
 class RecordingBittle:
     """Stand-in for the robot: records what the controller would have sent."""
 
     connected = True
-    commands = None
 
     def __init__(self):
         self.commands = []
@@ -89,65 +114,88 @@ class RecordingBittle:
         return {"L": R(), "R": R()}
 
 
-def classify(response: str) -> str:
+def verdict_for(controller, response: str) -> str:
+    outcome = getattr(controller, "last_outcome", None)
+    if outcome in OUTCOME_TO_VERDICT:
+        return OUTCOME_TO_VERDICT[outcome]
     if response.startswith("⚠️") or response.startswith("Error"):
         return "ERROR"
-    if response.startswith("I'm not sure"):
-        return "SUPPRESSED"
     if ACTION_RE.match(response):
         return "ACTION"
     return "NO-CALL"
 
 
-async def run_backend(name, controller_factory, commands, dry_run):
+async def run_backend(name, factory, dry_run):
     print(f"\n{'=' * 62}\n{name}\n{'=' * 62}")
-    rows = []
     try:
-        controller = controller_factory()
+        controller = factory()
     except Exception as e:
         print(f"  cannot construct {name}: {e}")
-        return rows
+        return []
+
+    notes = []
+    if name == "narrative" and controller.translator:
+        t = controller.translator
+        up = t.available()
+        notes.append(f"translator: {t.backend}" + (" (reachable)" if up else " (NOT reachable — fallback disabled)"))
+    if name == "hailo":
+        if not controller.list_models():
+            print(f"  skipped: no Hailo-Ollama server reachable at {controller.ollama_base_url}")
+            return []
+
     if dry_run:
         controller.bittle = RecordingBittle()
     else:
         if not await controller.connect():
             print(f"  ❌ {name}: could not connect to the robot")
-            return rows
+            return []
+
+    rows = []
     try:
-        for cmd in commands:
-            t0 = time.perf_counter()
-            try:
-                response = await controller.chat(cmd)
-            except Exception as e:
-                response = f"Error: {e}"
-            dt = (time.perf_counter() - t0) * 1000
-            verdict = classify(response)
-            robot_saw = getattr(controller.bittle, "commands", None)
-            row = (cmd, verdict, (robot_saw[-1] if robot_saw else "-"), response, dt)
-            rows.append(row)
-            mark = {"ACTION": "✓", "SUPPRESSED": "·", "NO-CALL": "✗", "ERROR": "✗"}[verdict]
-            print(f"  {mark} {cmd!r:40s} {verdict:11s} robot={row[2]:22s} {dt:5.0f} ms")
+        for section, commands in SECTIONS:
+            print(f"\n  --- {section} ---")
+            for cmd in commands:
+                t0 = time.perf_counter()
+                try:
+                    response = await controller.chat(cmd)
+                except Exception as e:
+                    response = f"Error: {e}"
+                dt = (time.perf_counter() - t0) * 1000
+                verdict = verdict_for(controller, response)
+                robot_saw = getattr(controller.bittle, "commands", None)
+                # only show the robot action if THIS row produced one
+                robot_cell = robot_saw[-1] if (robot_saw and verdict == "ACTION") else "-"
+                row = (cmd, verdict, robot_cell, response, dt)
+                rows.append(row)
+                mark = {"ACTION": "✓", "SUPPRESSED": "·", "NO-CALL": "✗", "ERROR": "✗"}[verdict]
+                print(f"  {mark} {cmd!r:45s} {verdict:11s} robot={row[2]:20s} {dt:5.0f} ms")
     finally:
         if not dry_run:
             await controller.disconnect()
         if hasattr(controller, "agent"):
             controller.agent.close()
 
+    if notes:
+        print(f"  ({'; '.join(notes)})")
     actions = sum(1 for r in rows if r[1] == "ACTION")
-    print(f"  ----\n  ACTION rate: {actions}/{len(rows)}"
-          + (f", SUPPRESSED: {sum(1 for r in rows if r[1] == 'SUPPRESSED')}"
-             if any(r[1] == "SUPPRESSED" for r in rows) else ""))
+    per_section = {}
+    idx = 0
+    for section, commands in SECTIONS:
+        n_act = sum(1 for r in rows[idx:idx + len(commands)] if r[1] == "ACTION")
+        per_section[section] = f"{n_act}/{len(commands)}"
+        idx += len(commands)
+    print(f"  ----\n  ACTION: {actions}/{len(rows)}   " +
+          "  ".join(f"{s}={v}" for s, v in per_section.items()))
     return rows
 
 
 def print_comparison(all_rows):
-    """Cross-backend table: same command, side by side."""
     if len(all_rows) < 2:
         return
-    commands = all_rows[0][0]
+    commands = [r[0] for r in all_rows[0][1]]  # every backend runs the same sections
     names = [n for n, _ in all_rows]
     print(f"\n{'=' * 62}\nSIDE BY SIDE\n{'=' * 62}")
-    header = f"  {'command':40s} " + " ".join(f"{n[:18]:>18s}" for n in names)
+    header = f"  {'command':45s} " + " ".join(f"{n[:16]:>16s}" for n in names)
     print(header)
     print("  " + "-" * (len(header) - 2))
     for i, cmd in enumerate(commands):
@@ -156,28 +204,34 @@ def print_comparison(all_rows):
             row = rows[i] if i < len(rows) else None
             v = row[1] if row else "-"
             robot = row[2] if row else ""
-            cells.append((v + (f" {robot}" if robot != "-" else ""))[:18].rjust(18))
-        print(f"  {cmd!r:40s} " + " ".join(cells))
+            cell = v + (f" {robot}" if robot not in ("-", "") else "")
+            cells.append(cell[:16].rjust(16))
+        print(f"  {cmd!r:45s} " + " ".join(cells))
 
 
 async def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    parser = argparse.ArgumentParser(description="Needle vs narrative vs Hailo A/B harness")
     parser.add_argument("--with-hailo", action="store_true",
-                        help="also run the Hailo-Ollama backend (http://localhost:8000 by default)")
+                        help="include the Hailo-Ollama direct backend (needs the server)")
     parser.add_argument("--dry-run", action="store_true",
                         help="mock the BLE robot (model-only test; no robot needed)")
     parser.add_argument("--commands", nargs="+", default=None,
-                        help="override the default command list")
+                        help="override the command lists with just these")
     args = parser.parse_args()
-    commands = args.commands or DEFAULT_COMMANDS
 
-    backends = [("needle", lambda: needle_mod.LLMBittleController())]
+    if args.commands:
+        SECTIONS[:] = [("CUSTOM", args.commands)]
+
+    backends = [
+        ("needle", lambda: needle_mod.LLMBittleController()),
+        ("narrative", lambda: narrative_mod.LLMBittleController()),
+    ]
     if args.with_hailo:
         backends.append(("hailo", lambda: hailo_mod.LLMBittleController()))
 
     all_rows = []
     for name, factory in backends:
-        rows = await run_backend(name, factory, commands, args.dry_run)
+        rows = await run_backend(name, factory, args.dry_run)
         if rows:
             all_rows.append((name, rows))
     print_comparison(all_rows)
