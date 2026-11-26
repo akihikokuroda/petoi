@@ -25,8 +25,14 @@ just the marketing):
   - The base model is accurate on direct commands ("sit down", "beep",
     "walk forward", "read the light sensor") and conservative on fuzzy ones
     ("bark at me", "tilt your head") — it suppresses rather than guesses.
-    The intended way to close that gap is Cactus fine-tuning: set
-    NEEDLE_WEIGHTS to the path of a fine-tuned .cact file.
+    "make bittle ..." phrasing is harder than bare verbs; this file uses a
+    Needle-tuned system prompt with few-shot examples for that phrasing and
+    hides bittle_get_status from the base model (it was a silent magnet for
+    confused commands — see HIDDEN_TOOLS below).
+  - The intended way to close the remaining accuracy gap is Cactus
+    fine-tuning: set NEEDLE_WEIGHTS to the path of a fine-tuned .cact file.
+    needle_ab.py in this repo A/B-tests a fixed command list across
+    backends, so you can measure the effect.
 
 Prerequisites:
   1. Python >= 3.9
@@ -96,10 +102,44 @@ class LLMBittleController(_HailoBackend):
         # Hailo-specific state from the parent is simply unused here
         # (ollama_url, model, keep_alive, conversation_history).
 
+    # Tools deliberately NOT advertised to the base Needle model. Measured
+    # against it: bittle_get_status is a magnet for confused commands —
+    # "make bittle sit", "make bittle rest", "make bittle look around" all
+    # resolved to it — and it is the one tool that "succeeds" without moving
+    # the robot, so its misfires are silent. With it out of the list the same
+    # commands either map to the right skill or fail safe via the engine's
+    # suppression guardrail. The handler itself is inherited and still works
+    # for the Hailo/LiteRT backends, which don't have this problem.
+    HIDDEN_TOOLS = {"bittle_get_status"}
+
     def get_tools(self):
         """Needle takes flat {name, description, parameters} dicts (the same
-        OpenAI-style schemas the Hailo variant wraps for the Ollama API)."""
-        return [t["function"] for t in super().get_tools()]
+        OpenAI-style schemas the Hailo variant wraps for the Ollama API),
+        minus HIDDEN_TOOLS (see above)."""
+        return [t["function"] for t in super().get_tools()
+                if t["function"]["name"] not in self.HIDDEN_TOOLS]
+
+    def get_system_prompt(self):
+        """Needle-specific system prompt (the Hailo variant's stays untouched
+        for A/B parity). Explicit rules plus few-shot examples lifted
+        skill-picking on "make bittle ..." phrasing in testing; fine-tuning
+        (NEEDLE_WEIGHTS) is the bigger lever if this is still not enough."""
+        return """You control a Petoi Bittle robot and pick exactly one tool per command.
+
+- Any motion or behavior command (sit, rest, stand, walk, dance, bark, stretch, ...) MUST use bittle_execute_skill with the closest skill name.
+- Words like "bittle", "dog", or "robot" in the command name the robot itself; ignore them.
+- bittle_control_motor is only for small fine adjustments of one body part; angles are -90 to +90 degrees.
+- bittle_sensor is for perception: action "read" for one measurement, "activate"/"deactivate" to stream (light, distance, touch, imu, gesture, vision).
+- If no tool fits the command exactly, pick the closest bittle_execute_skill.
+
+Examples:
+"make bittle sit" -> bittle_execute_skill(skill_name="sit")
+"make bittle rest" -> bittle_execute_skill(skill_name="rest")
+"make bittle walk" -> bittle_execute_skill(skill_name="walk_forward")
+"make bittle bark at me" -> bittle_execute_skill(skill_name="bark")
+"make bittle look around" -> bittle_control_motor(motor_name="neck", angle=45)
+"beep" -> bittle_beep()
+"how bright is it on your right side" -> bittle_sensor(action="read", sensor="light", side="R")"""
 
     async def connect(self) -> bool:
         """Connect to the Bittle and pre-warm the engine (first run downloads
